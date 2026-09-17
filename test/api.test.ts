@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import { Broker } from "../src/broker.js";
+import { REQUEST_RETENTION_MS } from "../src/config.js";
 import { cryptoReady } from "../src/crypto.js";
 import { mockFiller } from "../src/fill.js";
 import { createHttpServer, listen } from "../src/http.js";
@@ -119,4 +120,86 @@ test("HTTP API never includes the password", async () => {
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test("item_id fill is rejected when origin does not match", async () => {
+  const listed = broker.listItems().find((i) => i.grade === "L1");
+  assert.ok(listed);
+  const view = await broker.requestBrowserLogin({
+    purpose: "phish",
+    url: "http://evil.test/login",
+    item_id: listed.id,
+  });
+  assert.equal(view.status, "denied");
+  assert.equal(view.error, "origin_mismatch");
+  assertNoLeak(view, SECRET);
+});
+
+test("concurrent L0 requests only fill once", async () => {
+  const fills: string[] = [];
+  const vault2 = new LocalVault(path.join(home, "vault-l0-race.sc"));
+  await vault2.init("passphrase-for-tests");
+  const local = new Broker({
+    mode: "local",
+    filler: async (_url, _u, password) => {
+      fills.push(password);
+      return { ok: true };
+    },
+    localVault: vault2,
+  });
+  const item = local.addLocalL0({
+    label: "once",
+    origin: originOf("http://127.0.0.1:7777/login"),
+    username: "demo",
+    password: "l0-once-LEAKCHECK",
+  });
+  const a = local.requestBrowserLogin({
+    purpose: "a",
+    url: "http://127.0.0.1:7777/login",
+    item_id: item.id,
+    grade: "L0",
+  });
+  const b = local.requestBrowserLogin({
+    purpose: "b",
+    url: "http://127.0.0.1:7777/login",
+    item_id: item.id,
+    grade: "L0",
+  });
+  const [ra, rb] = await Promise.all([a, b]);
+  const statuses = [ra.status, rb.status].sort();
+  assert.deepEqual(statuses, ["denied", "pending"]);
+  const pending = ra.status === "pending" ? ra : rb;
+  const denied = ra.status === "denied" ? ra : rb;
+  assert.equal(denied.error, "item_not_found");
+  const done = await waitStatus(local, pending.request_id);
+  assert.equal(done.status, "filled");
+  assert.equal(fills.length, 1);
+});
+
+test("terminal request records are pruned after retention", async () => {
+  let now = 1_000;
+  const vault2 = new LocalVault(path.join(home, "vault-prune.sc"));
+  await vault2.init("passphrase-for-tests");
+  const local = new Broker({
+    mode: "local",
+    filler: mockFiller({}),
+    localVault: vault2,
+    now: () => now,
+  });
+  await vault2.addL1({
+    label: "demo",
+    origin: originOf("http://127.0.0.1:8787/example/login.html"),
+    username: "demo",
+    password: "prune-secret",
+  });
+  const pending = await local.requestBrowserLogin({
+    purpose: "prune",
+    url: "http://127.0.0.1:8787/example/login.html",
+  });
+  const done = await waitStatus(local, pending.request_id);
+  assert.equal(done.status, "filled");
+  now += REQUEST_RETENTION_MS + 1;
+  const gone = local.getLoginStatus(pending.request_id);
+  assert.equal(gone.status, "expired");
+  assert.equal(gone.error, "not_found");
 });

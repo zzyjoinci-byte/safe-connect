@@ -58,6 +58,24 @@ export class EphemeralStore {
     return v;
   }
 
+  takeSealed(id: string): EphemeralItem | undefined {
+    return this.consume(id);
+  }
+
+  takePlainByOrigin(origin: string): { id: string; username: string; password: string } | undefined {
+    const item = this.findByOrigin(origin);
+    if (!item) return undefined;
+    const plain = this.takePlain(item.id);
+    if (!plain) return undefined;
+    return { id: item.id, ...plain };
+  }
+
+  takeSealedByOrigin(origin: string): EphemeralItem | undefined {
+    const item = this.findByOrigin(origin);
+    if (!item) return undefined;
+    return this.consume(item.id);
+  }
+
   get(id: string): EphemeralItem | undefined {
     return this.items.get(id);
   }

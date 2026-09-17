@@ -224,51 +224,91 @@ async function cmdCompanion(flags: Flags): Promise<void> {
   const cfg = cfgFromFlags(flags);
   const material = readCompanionFile(cfg.companionPath);
   if (!material.privateKey) throw new Error("companion private key missing");
+  const privateKey = material.privateKey;
   const base = cfg.cloudUrl.replace(/\/$/, "");
   const auth = { Authorization: `Bearer ${hexe(material.pairingKey)}` };
   logInfo(`companion polling ${base} — approve unwrap grants in this terminal`);
-  const handled = new Set<string>();
-  const tick = async () => {
-    const hb = await fetch(`${base}/v1/companion/heartbeat`, {
-      method: "POST",
-      headers: { ...auth, "content-type": "application/json" },
-      body: JSON.stringify({ public_key: hexe(material.publicKey) }),
-    });
-    if (!hb.ok) {
-      logError(`heartbeat ${hb.status}`);
-      return;
-    }
-    const chRes = await fetch(`${base}/v1/companion/challenges`, { headers: auth });
-    if (!chRes.ok) return;
-    const body = (await chRes.json()) as { challenges: UnwrapChallenge[] };
-    for (const ch of body.challenges ?? []) {
-      if (handled.has(ch.request_id)) continue;
-      handled.add(ch.request_id);
-      const approved = await approveChallenge(ch, flags.yes || cfg.autoApprove);
-      if (!approved) {
-        await fetch(`${base}/v1/companion/deny`, {
+  const delivered = new Set<string>();
+  const pending = new Map<string, { kind: "deny" } | { kind: "grant"; grant: ReturnType<typeof createGrant> }>();
+  let ticking = false;
+
+  const postDecision = async (requestId: string): Promise<boolean> => {
+    const decision = pending.get(requestId);
+    if (!decision) return true;
+    try {
+      if (decision.kind === "deny") {
+        const res = await fetch(`${base}/v1/companion/deny`, {
           method: "POST",
           headers: { ...auth, "content-type": "application/json" },
-          body: JSON.stringify({ request_id: ch.request_id }),
+          body: JSON.stringify({ request_id: requestId }),
         });
-        continue;
+        if (!res.ok) {
+          logError(`deny delivery ${res.status}`);
+          return false;
+        }
+      } else {
+        const res = await fetch(`${base}/v1/companion/grant`, {
+          method: "POST",
+          headers: { ...auth, "content-type": "application/json" },
+          body: JSON.stringify(decision.grant),
+        });
+        if (!res.ok) {
+          logError(`grant delivery ${res.status}`);
+          return false;
+        }
+        logInfo(`grant sent for ${requestId}`);
       }
-      if (!material.privateKey) throw new Error("companion private key missing");
-      const grant = createGrant({
-        pairingKey: material.pairingKey,
-        publicKey: material.publicKey,
-        privateKey: material.privateKey,
-        sealedDekB64: ch.sealed_dek,
-        requestId: ch.request_id,
-        url: ch.url,
-        ttlMs: Math.min(ch.expires_in * 1000, 30_000),
-      });
-      await fetch(`${base}/v1/companion/grant`, {
+      pending.delete(requestId);
+      delivered.add(requestId);
+      return true;
+    } catch (err) {
+      logError(err instanceof Error ? err.message : "delivery failed");
+      return false;
+    }
+  };
+
+  const tick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const hb = await fetch(`${base}/v1/companion/heartbeat`, {
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
-        body: JSON.stringify(grant),
+        body: JSON.stringify({ public_key: hexe(material.publicKey) }),
       });
-      logInfo(`grant sent for ${ch.request_id}`);
+      if (!hb.ok) {
+        logError(`heartbeat ${hb.status}`);
+        return;
+      }
+      for (const id of [...pending.keys()]) {
+        await postDecision(id);
+      }
+      const chRes = await fetch(`${base}/v1/companion/challenges`, { headers: auth });
+      if (!chRes.ok) return;
+      const body = (await chRes.json()) as { challenges: UnwrapChallenge[] };
+      for (const ch of body.challenges ?? []) {
+        if (delivered.has(ch.request_id) || pending.has(ch.request_id)) continue;
+        const approved = await approveChallenge(ch, flags.yes || cfg.autoApprove);
+        if (!approved) {
+          pending.set(ch.request_id, { kind: "deny" });
+        } else {
+          pending.set(ch.request_id, {
+            kind: "grant",
+            grant: createGrant({
+              pairingKey: material.pairingKey,
+              publicKey: material.publicKey,
+              privateKey,
+              sealedDekB64: ch.sealed_dek,
+              requestId: ch.request_id,
+              url: ch.url,
+              ttlMs: Math.min(ch.expires_in * 1000, 30_000),
+            }),
+          });
+        }
+        await postDecision(ch.request_id);
+      }
+    } finally {
+      ticking = false;
     }
   };
   await tick();
@@ -311,30 +351,27 @@ async function cmdAdd(flags: Flags): Promise<void> {
   const mode = flags.mode ?? inferAddMode(cfg);
 
   if (mode === "local") {
-    if (grade === "L0" || fs.existsSync(adminTokenPath(cfg.home))) {
-      const token = hexe(readAdminToken(cfg.home));
-      const res = await fetch(`http://${cfg.bind}:${cfg.port}/v1/admin/items`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ grade, label, url, username, password }),
-      });
-      if (!res.ok) throw new Error(`local add failed: HTTP ${res.status} (is serve running?)`);
-      console.log(JSON.stringify(await res.json()));
+    const admin = await tryLocalAdminAdd(cfg, { grade, label, url, username, password });
+    if (admin.ok) {
+      console.log(JSON.stringify(admin.body));
       return;
     }
-    if (grade === "L1") {
-      const vault = new LocalVault(cfg.vaultPath);
-      if (!fs.existsSync(cfg.vaultPath)) throw new Error("run safe-connect init --mode local first");
-      const pass = await promptSecret("Vault passphrase", flags.passphrase ?? cfg.passphrase);
-      await vault.unlock(pass);
-      const item = await vault.addL1({ label, origin, username, password });
-      console.log(JSON.stringify(item));
-      logInfo("added to vault file — restart serve if it is already running");
-      return;
+    if (grade === "L0") {
+      throw new Error("L0 is memory-only and requires a running `safe-connect serve`");
     }
+    if (admin.reachable) {
+      logInfo(`admin endpoint returned HTTP ${admin.status ?? "error"} — falling back to vault file`);
+    } else if (fs.existsSync(adminTokenPath(cfg.home))) {
+      logInfo("broker not reachable — adding L1 to vault file");
+    }
+    const vault = new LocalVault(cfg.vaultPath);
+    if (!fs.existsSync(cfg.vaultPath)) throw new Error("run safe-connect init --mode local first");
+    const pass = await promptSecret("Vault passphrase", flags.passphrase ?? cfg.passphrase);
+    await vault.unlock(pass);
+    const item = await vault.addL1({ label, origin, username, password });
+    console.log(JSON.stringify(item));
+    logInfo("added to vault file — restart serve if it is already running");
+    return;
   }
 
   const material = readCompanionFile(cfg.companionPath);
@@ -388,6 +425,30 @@ function inferAddMode(cfg: AppConfig): "local" | "cloud" {
   if (cfg.mode === "cloud") return "cloud";
   if (fs.existsSync(cfg.companionPath) && !fs.existsSync(cfg.vaultPath)) return "cloud";
   return "local";
+}
+
+async function tryLocalAdminAdd(
+  cfg: AppConfig,
+  payload: { grade: Grade; label: string; url: string; username: string; password: string },
+): Promise<{ ok: true; body: unknown } | { ok: false; reachable: boolean; status?: number }> {
+  if (!fs.existsSync(adminTokenPath(cfg.home))) {
+    return { ok: false, reachable: false };
+  }
+  try {
+    const token = hexe(readAdminToken(cfg.home));
+    const res = await fetch(`http://${cfg.bind}:${cfg.port}/v1/admin/items`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) return { ok: true, body: await res.json() };
+    return { ok: false, reachable: true, status: res.status };
+  } catch {
+    return { ok: false, reachable: false };
+  }
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {

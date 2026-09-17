@@ -6,6 +6,8 @@ import type { Mode } from "./types.js";
 export const VERSION = "0.1.0";
 export const GRANT_TTL_MS = 30_000;
 export const HEARTBEAT_STALE_MS = 10_000;
+export const REQUEST_RETENTION_MS = 5 * 60_000;
+export const MAX_REQUEST_RECORDS = 2_000;
 export const DEFAULT_PORT = 8787;
 
 export interface AppConfig {

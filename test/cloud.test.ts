@@ -279,3 +279,70 @@ test("pairing bearer is required for companion routes", async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test("cloud item_id fill is rejected when origin does not match", async () => {
+  const pairing = generatePairing();
+  const vault = new CloudVault(path.join(home, "cloud-origin.sc"));
+  vault.configure(pairing.pairingKey, pairing.publicKey);
+  const fillStore: { last?: { url: string; username: string; password: string } } = {};
+  const broker = new Broker({
+    mode: "cloud",
+    filler: mockFiller(fillStore),
+    cloudVault: vault,
+    pairing: { pairingKey: pairing.pairingKey, publicKey: pairing.publicKey },
+  });
+  broker.heartbeat(pairing.publicKey);
+  const sealed = sealCredential(pairing.publicKey, { username: "demo", password: SECRET });
+  broker.addSealedItem({
+    id: "orig1",
+    label: "demo",
+    origin: originOf("http://127.0.0.1:8787/login"),
+    grade: "L1",
+    sealed,
+  });
+  const view = await broker.requestBrowserLogin({
+    purpose: "phish",
+    url: "http://evil.test/login",
+    item_id: "orig1",
+  });
+  assert.equal(view.status, "denied");
+  assert.equal(view.error, "origin_mismatch");
+  assert.equal(fillStore.last, undefined);
+});
+
+test("cloud concurrent L0 requests only consume once", async () => {
+  const pairing = generatePairing();
+  const vault = new CloudVault(path.join(home, "cloud-l0-race.sc"));
+  vault.configure(pairing.pairingKey, pairing.publicKey);
+  const broker = new Broker({
+    mode: "cloud",
+    filler: mockFiller({}),
+    cloudVault: vault,
+    pairing: { pairingKey: pairing.pairingKey, publicKey: pairing.publicKey },
+  });
+  broker.heartbeat(pairing.publicKey);
+  const sealed = sealCredential(pairing.publicKey, { username: "demo", password: "cloud-l0-race" });
+  broker.addSealedItem({
+    id: "l0race",
+    label: "once",
+    origin: originOf("http://127.0.0.1:8888/login"),
+    grade: "L0",
+    sealed,
+  });
+  const a = await broker.requestBrowserLogin({
+    purpose: "a",
+    url: "http://127.0.0.1:8888/login",
+    item_id: "l0race",
+    grade: "L0",
+  });
+  const b = await broker.requestBrowserLogin({
+    purpose: "b",
+    url: "http://127.0.0.1:8888/login",
+    item_id: "l0race",
+    grade: "L0",
+  });
+  const statuses = [a.status, b.status].sort();
+  assert.deepEqual(statuses, ["denied", "pending"]);
+  const denied = a.status === "denied" ? a : b;
+  assert.equal(denied.error, "item_not_found");
+});

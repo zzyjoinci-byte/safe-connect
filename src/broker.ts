@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { GRANT_TTL_MS, HEARTBEAT_STALE_MS, VERSION } from "./config.js";
+import { GRANT_TTL_MS, HEARTBEAT_STALE_MS, MAX_REQUEST_RECORDS, REQUEST_RETENTION_MS, VERSION } from "./config.js";
 import { confirmCode, memzero } from "./crypto.js";
 import { EphemeralStore } from "./ephemeral.js";
 import { createGrant, decryptItem, openGrant, zeroizeCredential } from "./grants.js";
@@ -164,6 +164,7 @@ export class Broker {
   }
 
   getLoginStatus(requestId: string): LoginRequestView {
+    this.prune();
     const rec = this.requests.get(requestId);
     if (!rec) {
       return { request_id: requestId, status: "expired", error: "not_found" };
@@ -173,40 +174,15 @@ export class Broker {
   }
 
   async requestBrowserLogin(input: LoginRequestInput): Promise<LoginRequestView> {
+    this.prune();
     if (this.mode === "cloud" && this.companionStatus() !== "paired") {
-      const request_id = randomUUID();
-      const rec: LoginRequestRecord = {
-        request_id,
-        status: "denied",
-        error: "companion_missing",
-        purpose: input.purpose,
-        url: input.url,
-        item_id: input.item_id ?? "",
-        grade: input.grade ?? "L1",
-        created_at: this.now(),
-        grant_expires_at: this.now(),
-      };
-      this.requests.set(request_id, rec);
-      return viewOf(rec);
+      return this.recordDenied(input, "companion_missing", input.grade ?? "L1");
     }
 
     const origin = originOf(input.url);
     const resolved = this.resolveItem(origin, input.item_id, input.grade);
-    if (!resolved) {
-      const request_id = randomUUID();
-      const rec: LoginRequestRecord = {
-        request_id,
-        status: "denied",
-        error: "item_not_found",
-        purpose: input.purpose,
-        url: input.url,
-        item_id: input.item_id ?? "",
-        grade: input.grade ?? "L1",
-        created_at: this.now(),
-        grant_expires_at: this.now(),
-      };
-      this.requests.set(request_id, rec);
-      return viewOf(rec);
+    if (!resolved.ok) {
+      return this.recordDenied(input, resolved.error, input.grade ?? "L1");
     }
 
     const request_id = randomUUID();
@@ -216,8 +192,8 @@ export class Broker {
       status: "pending",
       purpose: input.purpose,
       url: input.url,
-      item_id: resolved.id,
-      grade: resolved.grade,
+      item_id: resolved.value.id,
+      grade: resolved.value.grade,
       created_at: this.now(),
       grant_expires_at: this.now() + ttl,
       confirm_code: confirmCode(),
@@ -225,12 +201,12 @@ export class Broker {
     this.requests.set(request_id, rec);
 
     if (this.mode === "local") {
-      if (resolved.kind !== "local-plain") {
+      if (resolved.value.kind !== "local-plain") {
         rec.status = "denied";
         rec.error = "bad_item";
         return viewOf(rec);
       }
-      void this.runLocalFill(rec, resolved).catch((err) => {
+      void this.runLocalFill(rec, resolved.value).catch((err) => {
         rec.status = "denied";
         rec.error = "fill_failed";
         logInfo(`local fill error: ${err instanceof Error ? err.message : "unknown"}`);
@@ -238,12 +214,12 @@ export class Broker {
       return viewOf(rec);
     }
 
-    if (resolved.kind !== "sealed") {
+    if (resolved.value.kind !== "sealed") {
       rec.status = "denied";
       rec.error = "bad_item";
       return viewOf(rec);
     }
-    void this.runCloudFill(rec, resolved, ttl).catch((err) => {
+    void this.runCloudFill(rec, resolved.value, ttl).catch((err) => {
       if (rec.status === "pending") {
         rec.status = "denied";
         rec.error = err instanceof Error ? sanitizeErr(err.message) : "denied";
@@ -309,56 +285,99 @@ export class Broker {
     });
   }
 
+  private recordDenied(
+    input: LoginRequestInput,
+    error: string,
+    grade: "L0" | "L1",
+  ): LoginRequestView {
+    const request_id = randomUUID();
+    const rec: LoginRequestRecord = {
+      request_id,
+      status: "denied",
+      error,
+      purpose: input.purpose,
+      url: input.url,
+      item_id: input.item_id ?? "",
+      grade,
+      created_at: this.now(),
+      grant_expires_at: this.now(),
+    };
+    this.requests.set(request_id, rec);
+    return viewOf(rec);
+  }
+
   private resolveItem(
     origin: string,
     itemId?: string,
     grade?: "L0" | "L1",
   ):
-    | { id: string; grade: "L0" | "L1"; kind: "local-plain"; username: string; password: string }
-    | { id: string; grade: "L0" | "L1"; kind: "sealed"; sealed_dek: string; nonce: string; ciphertext: string; consumeL0: boolean }
-    | undefined {
+    | { ok: true; value:
+        | { id: string; grade: "L0" | "L1"; kind: "local-plain"; username: string; password: string }
+        | { id: string; grade: "L0" | "L1"; kind: "sealed"; sealed_dek: string; nonce: string; ciphertext: string; consumeL0: boolean }
+      }
+    | { ok: false; error: "item_not_found" | "origin_mismatch" } {
     if (this.mode === "local") {
       if (itemId) {
-        const l0 = this.ephemeral.getPlain(itemId);
-        if (l0) {
-          return { id: itemId, grade: "L0", kind: "local-plain", ...l0 };
+        const l0meta = this.ephemeral.get(itemId);
+        if (l0meta) {
+          if (l0meta.origin !== origin) return { ok: false, error: "origin_mismatch" };
+          const plain = this.ephemeral.takePlain(itemId);
+          if (!plain) return { ok: false, error: "item_not_found" };
+          return { ok: true, value: { id: itemId, grade: "L0", kind: "local-plain", ...plain } };
         }
         const l1 = this.localVault?.get(itemId);
         if (l1) {
-          return { id: l1.id, grade: "L1", kind: "local-plain", username: l1.username, password: l1.password };
+          if (l1.origin !== origin) return { ok: false, error: "origin_mismatch" };
+          return {
+            ok: true,
+            value: { id: l1.id, grade: "L1", kind: "local-plain", username: l1.username, password: l1.password },
+          };
         }
-        return undefined;
+        return { ok: false, error: "item_not_found" };
       }
       if (!grade || grade === "L0") {
-        const l0item = this.ephemeral.findByOrigin(origin);
-        if (l0item) {
-          const plain = this.ephemeral.getPlain(l0item.id);
-          if (plain) return { id: l0item.id, grade: "L0", kind: "local-plain", ...plain };
+        const taken = this.ephemeral.takePlainByOrigin(origin);
+        if (taken) {
+          return { ok: true, value: { id: taken.id, grade: "L0", kind: "local-plain", username: taken.username, password: taken.password } };
         }
       }
       if (!grade || grade === "L1") {
         const l1 = this.localVault?.findByOrigin(origin);
         if (l1) {
-          return { id: l1.id, grade: "L1", kind: "local-plain", username: l1.username, password: l1.password };
+          return {
+            ok: true,
+            value: { id: l1.id, grade: "L1", kind: "local-plain", username: l1.username, password: l1.password },
+          };
         }
       }
-      return undefined;
+      return { ok: false, error: "item_not_found" };
     }
 
-    const sealed = itemId
-      ? this.ephemeral.get(itemId) ?? this.cloudVault?.get(itemId)
-      : (grade !== "L1" ? this.ephemeral.findByOrigin(origin) : undefined) ??
-        (grade !== "L0" ? this.cloudVault?.findByOrigin(origin) : undefined);
-    if (!sealed) return undefined;
-    return {
-      id: sealed.id,
-      grade: sealed.grade,
-      kind: "sealed",
-      sealed_dek: sealed.sealed.sealed_dek,
-      nonce: sealed.sealed.nonce,
-      ciphertext: sealed.sealed.ciphertext,
-      consumeL0: sealed.grade === "L0",
-    };
+    if (itemId) {
+      const eph = this.ephemeral.get(itemId);
+      if (eph) {
+        if (eph.origin !== origin) return { ok: false, error: "origin_mismatch" };
+        const taken = this.ephemeral.takeSealed(itemId);
+        if (!taken) return { ok: false, error: "item_not_found" };
+        return { ok: true, value: sealedValue(taken, true) };
+      }
+      const l1 = this.cloudVault?.get(itemId);
+      if (l1) {
+        if (l1.origin !== origin) return { ok: false, error: "origin_mismatch" };
+        return { ok: true, value: sealedValue(l1, false) };
+      }
+      return { ok: false, error: "item_not_found" };
+    }
+
+    if (grade !== "L1") {
+      const taken = this.ephemeral.takeSealedByOrigin(origin);
+      if (taken) return { ok: true, value: sealedValue(taken, true) };
+    }
+    if (grade !== "L0") {
+      const l1 = this.cloudVault?.findByOrigin(origin);
+      if (l1) return { ok: true, value: sealedValue(l1, false) };
+    }
+    return { ok: false, error: "item_not_found" };
   }
 
   private async runLocalFill(
@@ -366,9 +385,6 @@ export class Broker {
     resolved: { id: string; grade: "L0" | "L1"; kind: "local-plain"; username: string; password: string },
   ): Promise<void> {
     const result = await this.filler(rec.url, resolved.username, resolved.password);
-    if (resolved.grade === "L0") {
-      this.ephemeral.consume(resolved.id);
-    }
     rec.status = result.ok ? "filled" : "denied";
     rec.error = result.ok ? undefined : result.error ?? "fill_failed";
   }
@@ -432,9 +448,6 @@ export class Broker {
       const result = await this.filler(rec.url, cred.username, cred.password);
       rec.status = result.ok ? "filled" : "denied";
       rec.error = result.ok ? undefined : result.error ?? "fill_failed";
-      if (resolved.consumeL0) {
-        this.ephemeral.consume(resolved.id);
-      }
     } catch (err) {
       rec.status = "denied";
       rec.error = sanitizeErr(err instanceof Error ? err.message : "unwrap_failed");
@@ -455,6 +468,49 @@ export class Broker {
       }
     }
   }
+
+  private prune(): void {
+    const cutoff = this.now() - REQUEST_RETENTION_MS;
+    for (const [id, rec] of this.requests) {
+      this.expireIfNeeded(rec);
+      if (rec.status !== "pending" && rec.created_at <= cutoff) {
+        this.requests.delete(id);
+        this.consumedGrants.delete(id);
+      }
+    }
+    if (this.requests.size <= MAX_REQUEST_RECORDS) return;
+    const surplus = [...this.requests.entries()]
+      .filter(([, rec]) => rec.status !== "pending")
+      .sort((a, b) => a[1].created_at - b[1].created_at);
+    const drop = this.requests.size - MAX_REQUEST_RECORDS;
+    for (const [id] of surplus.slice(0, Math.max(0, drop))) {
+      this.requests.delete(id);
+      this.consumedGrants.delete(id);
+    }
+  }
+}
+
+function sealedValue(
+  item: SealedItem,
+  consumeL0: boolean,
+): {
+  id: string;
+  grade: "L0" | "L1";
+  kind: "sealed";
+  sealed_dek: string;
+  nonce: string;
+  ciphertext: string;
+  consumeL0: boolean;
+} {
+  return {
+    id: item.id,
+    grade: item.grade,
+    kind: "sealed",
+    sealed_dek: item.sealed.sealed_dek,
+    nonce: item.sealed.nonce,
+    ciphertext: item.sealed.ciphertext,
+    consumeL0,
+  };
 }
 
 function viewOf(rec: LoginRequestRecord): LoginRequestView {
