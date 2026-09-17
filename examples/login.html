@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Safe Connect example login</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 24rem; margin: 3rem auto; }
+    label { display: block; margin: 0.75rem 0 0.25rem; }
+    input { width: 100%; padding: 0.4rem; }
+    button { margin-top: 1rem; padding: 0.5rem 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Example login</h1>
+  <p>Demo credentials: <code>demo</code> / <code>demo-pass-NOT-SECRET</code></p>
+  <form id="login-form">
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" />
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" />
+    <button id="login" type="submit">Log in</button>
+  </form>
+  <script>
+    document.getElementById("login-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const username = document.getElementById("username").value;
+      const password = document.getElementById("password").value;
+      const ok = username === "demo" && password === "demo-pass-NOT-SECRET";
+      document.body.innerHTML =
+        '<p id="login-result" data-status="' + (ok ? "ok" : "fail") + '">' +
+        (ok ? "Welcome" : "Invalid") +
+        "</p>";
+    });
+  </script>
+</body>
+</html>

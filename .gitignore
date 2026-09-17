@@ -1,0 +1,26 @@
+node_modules/
+dist/
+coverage/
+.playwright/
+test-results/
+playwright-report/
+blob-report/
+
+.env
+.env.*
+!.env.example
+
+# Vaults, pairing material, runtime data — never commit
+.safe-connect/
+data/
+*.sc
+*.vault
+companion.json
+vault.bin
+
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.tsbuildinfo
