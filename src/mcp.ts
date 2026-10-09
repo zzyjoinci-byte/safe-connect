@@ -3,7 +3,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import type { Broker } from "./broker.js";
 import { VERSION } from "./config.js";
-import type { LoginRequestInput, LoginRequestView } from "./types.js";
+import type { ProfileView, SessionView } from "./sessions.js";
+import type { Grade, LoginRequestInput, LoginRequestView } from "./types.js";
 
 const RequestShape = {
   purpose: z.string().min(1).describe("Why the agent needs this login"),
@@ -13,10 +14,21 @@ const RequestShape = {
   ttl_seconds: z.number().int().positive().max(300).optional(),
 };
 
+export interface SessionBackend {
+  listSessionProfiles(): Promise<{ profiles: ProfileView[] } | { error: string }>;
+  createLoginSession(profileId: string): Promise<SessionView | { error: string }>;
+  getSessionStatus(sessionId: string): Promise<SessionView | { error: string }>;
+  attachSessionCredentials(sessionId: string, itemId: string, revision: number, grade?: Grade):
+    Promise<SessionView | { error: string }>;
+  continueLoginSession(sessionId: string, revision: number): Promise<SessionView | { error: string }>;
+  cancelLoginSession(sessionId: string): Promise<SessionView | { error: string }>;
+}
+
 export interface LoginBackend {
   requestBrowserLogin(input: LoginRequestInput): Promise<LoginRequestView>;
   getLoginStatus(requestId: string): LoginRequestView | Promise<LoginRequestView>;
   isFailClosed?: () => boolean;
+  sessions?: SessionBackend;
 }
 
 export function brokerBackend(broker: Broker): LoginBackend {
@@ -27,8 +39,55 @@ export function brokerBackend(broker: Broker): LoginBackend {
   };
 }
 
+async function sessionFetch(url: string, init?: RequestInit): Promise<SessionView | { error: string }> {
+  const r = await fetch(url, init);
+  const json = (await r.json()) as SessionView & { error?: string };
+  if (!r.ok) return { error: json.error ?? `http_${r.status}` };
+  const { control_token: _ignored, ...view } = json as SessionView & { control_token?: string };
+  return view;
+}
+
 export function httpBackend(baseUrl: string): LoginBackend {
   const base = baseUrl.replace(/\/$/, "");
+  const sessions: SessionBackend = {
+    async listSessionProfiles() {
+      const r = await fetch(`${base}/v1/session_profiles`);
+      const json = (await r.json()) as { profiles?: ProfileView[]; error?: string };
+      if (!r.ok) return { error: json.error ?? `http_${r.status}` };
+      return { profiles: json.profiles ?? [] };
+    },
+    createLoginSession(profileId) {
+      return sessionFetch(`${base}/v1/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ profile_id: profileId }),
+      });
+    },
+    getSessionStatus(sessionId) {
+      return sessionFetch(`${base}/v1/sessions/${encodeURIComponent(sessionId)}`);
+    },
+    attachSessionCredentials(sessionId, itemId, revision, grade) {
+      return sessionFetch(`${base}/v1/sessions/${encodeURIComponent(sessionId)}/credentials`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision, item_id: itemId, ...(grade ? { grade } : {}) }),
+      });
+    },
+    continueLoginSession(sessionId, revision) {
+      return sessionFetch(`${base}/v1/sessions/${encodeURIComponent(sessionId)}/continue`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision }),
+      });
+    },
+    cancelLoginSession(sessionId) {
+      return sessionFetch(`${base}/v1/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+    },
+  };
   return {
     async requestBrowserLogin(input) {
       const r = await fetch(`${base}/v1/request_browser_login`, {
@@ -50,10 +109,20 @@ export function httpBackend(baseUrl: string): LoginBackend {
       const r = await fetch(`${base}/v1/requests/${encodeURIComponent(requestId)}`);
       return (await r.json()) as LoginRequestView;
     },
+    sessions,
   };
 }
 
-export const MCP_TOOLS = ["request_browser_login", "get_login_status"] as const;
+export const MCP_TOOLS = [
+  "request_browser_login",
+  "get_login_status",
+  "list_session_profiles",
+  "create_login_session",
+  "attach_session_credentials",
+  "get_session_status",
+  "continue_login_session",
+  "cancel_login_session",
+] as const;
 
 export function createMcpServer(backend: LoginBackend): McpServer {
   const server = new McpServer(
@@ -111,6 +180,81 @@ export function createMcpServer(backend: LoginBackend): McpServer {
           },
         ],
       };
+    },
+  );
+
+  const sessionUnavailable = {
+    content: [{ type: "text" as const, text: JSON.stringify({ error: "sessions_not_configured" }) }],
+    isError: true,
+  };
+
+  const sessionResult = (view: SessionView | { error: string } | { profiles: ProfileView[] }) => ({
+    content: [{ type: "text" as const, text: JSON.stringify(view) }],
+    ...("error" in view ? { isError: true } : {}),
+  });
+
+  server.tool(
+    "list_session_profiles",
+    "List built-in controlled-session profile ids and origins. Never returns secrets or selectors.",
+    {},
+    async () => {
+      if (!backend.sessions) return sessionUnavailable;
+      return sessionResult(await backend.sessions.listSessionProfiles());
+    },
+  );
+
+  server.tool(
+    "create_login_session",
+    "Open a controlled login session for a named profile (e.g. app-store-connect). Returns session_id and state only. Never returns secrets. Does not submit the form or complete 2FA.",
+    { profile_id: z.string().min(1).max(64).describe("Trusted profile id, such as app-store-connect") },
+    async ({ profile_id }) => {
+      if (!backend.sessions) return sessionUnavailable;
+      return sessionResult(await backend.sessions.createLoginSession(profile_id));
+    },
+  );
+
+  server.tool(
+    "attach_session_credentials",
+    "Attach a vault item to a controlled session. Fills username and password only; never submits. Returns session state. Never returns secrets.",
+    {
+      session_id: z.string().min(1),
+      item_id: z.string().min(1),
+      revision: z.number().int().nonnegative(),
+      grade: z.enum(["L0", "L1"]).optional(),
+    },
+    async ({ session_id, item_id, revision, grade }) => {
+      if (!backend.sessions) return sessionUnavailable;
+      return sessionResult(await backend.sessions.attachSessionCredentials(session_id, item_id, revision, grade));
+    },
+  );
+
+  server.tool(
+    "get_session_status",
+    "Poll a controlled login session. Returns state such as awaiting_user_submit, manual_required, authenticated. Never returns secrets.",
+    { session_id: z.string().min(1) },
+    async ({ session_id }) => {
+      if (!backend.sessions) return sessionUnavailable;
+      return sessionResult(await backend.sessions.getSessionStatus(session_id));
+    },
+  );
+
+  server.tool(
+    "continue_login_session",
+    "Inspect a controlled session for manual challenges or success evidence. Never submits a form and never returns secrets.",
+    { session_id: z.string().min(1), revision: z.number().int().nonnegative() },
+    async ({ session_id, revision }) => {
+      if (!backend.sessions) return sessionUnavailable;
+      return sessionResult(await backend.sessions.continueLoginSession(session_id, revision));
+    },
+  );
+
+  server.tool(
+    "cancel_login_session",
+    "Cancel a controlled login session and destroy its browser context. Never returns secrets.",
+    { session_id: z.string().min(1) },
+    async ({ session_id }) => {
+      if (!backend.sessions) return sessionUnavailable;
+      return sessionResult(await backend.sessions.cancelLoginSession(session_id));
     },
   );
 

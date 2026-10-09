@@ -3,6 +3,7 @@
 ```
 Agent (HTTP JSON or MCP)
         │  request_browser_login / get_login_status
+        │  sessions: create / credentials / status / continue / cancel
         │  (status only — never secrets)
         ▼
 ┌───────────────────┐     local mode: Playwright fill on this host
@@ -53,7 +54,9 @@ Files are written `0600` under `SAFE_CONNECT_HOME` (default `~/.safe-connect`), 
 
 ## Fill
 
-`playwrightFill` launches Chromium, opens the requested URL, fills `username` / `password` fields, submits. The example page at `/example/login.html` exposes `#login-result[data-status=ok|fail]` for tests.
+`playwrightFill` launches Chromium, opens the requested URL, fills `username` / `password` fields on the **top-level** document, submits, and closes the page. It cannot complete iframe or 2FA logins.
+
+`ControlledSessions` keeps a BrowserContext, optionally fills a unique same-profile child iframe, and stops at `awaiting_user_submit` so a human can submit and complete OTP. `SAFE_CONNECT_HEADED=1` shows Chromium on the existing display. See [controlled sessions](controlled-sessions.md).
 
 ## Control channel
 

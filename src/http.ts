@@ -7,7 +7,7 @@ import { hexd, timingSafeEqual } from "./bytes.js";
 import type { Broker } from "./broker.js";
 import { VERSION } from "./config.js";
 import { logError } from "./logger.js";
-import { ControlledSessions, SessionError } from "./sessions.js";
+import { ControlledSessions, PUBLIC_SESSION, SessionError, type SessionView } from "./sessions.js";
 import type { CryptoGrant, Grade, SealedItem } from "./types.js";
 
 const RequestLoginSchema = z.object({
@@ -56,7 +56,7 @@ export interface HttpOptions {
   adminToken?: Uint8Array;
   bind: string;
   port: number;
-  /** Opt-in trusted integration. No new listener or default login profiles. */
+  /** Trusted integration. `serve` supplies built-in profiles unless SAFE_CONNECT_SESSIONS=0. */
   sessions?: ControlledSessions;
 }
 
@@ -115,6 +115,59 @@ function publicRequest(view: { request_id: string; status: string; error?: strin
   };
 }
 
+function publicSessionView(view: SessionView & { control_token: string }): SessionView {
+  const { control_token: _ignored, ...rest } = view;
+  return rest;
+}
+
+async function dispatchSession(
+  res: http.ServerResponse,
+  req: http.IncomingMessage,
+  method: string,
+  sessions: ControlledSessions | undefined,
+  id: string | undefined,
+  action: string | undefined,
+  token: string | null,
+  opts: { public: boolean },
+): Promise<void> {
+  if (!sessions) { send(res, 503, { error: "sessions_not_configured" }); return; }
+  try {
+    if (method === "GET" && id && !action) { send(res, 200, sessions.status(id, token)); return; }
+    if (method !== "POST") { send(res, 405, { error: "method_not_allowed" }); return; }
+    let body: unknown;
+    try { body = JSON.parse(await readBody(req) || "{}"); }
+    catch { send(res, 400, { error: "invalid_request" }); return; }
+    if (!id) {
+      const parsed = z.object({ profile_id: z.string().min(1).max(64) }).strict().safeParse(body);
+      if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
+      const created = await sessions.create(parsed.data.profile_id);
+      send(res, 201, opts.public ? publicSessionView(created) : created);
+      return;
+    }
+    if (action === "credentials") {
+      const parsed = z.object({ revision: z.number().int().nonnegative(), item_id: z.string().min(1), grade: z.enum(["L0", "L1"]).optional() }).strict().safeParse(body);
+      if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
+      send(res, 200, await sessions.credentials(id, token, parsed.data.revision, parsed.data.item_id, parsed.data.grade));
+      return;
+    }
+    if (action === "continue") {
+      const parsed = z.object({ revision: z.number().int().nonnegative() }).strict().safeParse(body);
+      if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
+      send(res, 200, await sessions.continue(id, token, parsed.data.revision));
+      return;
+    }
+    if (action === "cancel") {
+      if (!z.object({}).strict().safeParse(body).success) { send(res, 400, { error: "invalid_request" }); return; }
+      send(res, 200, await sessions.cancel(id, token));
+      return;
+    }
+    send(res, 404, { error: "not_found" });
+  } catch (err) {
+    // Do not log browser errors, page data, control tokens, or request bodies.
+    send(res, err instanceof SessionError ? err.status : 500, { error: err instanceof SessionError ? err.code : "session_operation_failed" });
+  }
+}
+
 export function createHttpServer(opts: HttpOptions): http.Server {
   const { broker, pairingKey, adminToken } = opts;
   const server = http.createServer(async (req, res) => {
@@ -123,6 +176,18 @@ export function createHttpServer(opts: HttpOptions): http.Server {
       const url = new URL(req.url ?? "/", `http://${host}`);
       const method = req.method ?? "GET";
 
+      if (method === "GET" && url.pathname === "/v1/session_profiles") {
+        if (!opts.sessions) { send(res, 503, { error: "sessions_not_configured" }); return; }
+        send(res, 200, { profiles: opts.sessions.listProfiles() });
+        return;
+      }
+
+      const publicSession = url.pathname.match(/^\/v1\/sessions(?:\/([^/]+)(?:\/(credentials|continue|cancel))?)?$/);
+      if (publicSession) {
+        await dispatchSession(res, req, method, opts.sessions, publicSession[1], publicSession[2], PUBLIC_SESSION, { public: true });
+        return;
+      }
+
       const sessionRoute = url.pathname.match(/^\/v1\/(admin|companion)\/sessions(?:\/([^/]+)(?:\/(credentials|continue|cancel))?)?$/);
       if (sessionRoute) {
         const scope = broker.mode === "cloud" ? "companion" : "admin";
@@ -130,41 +195,9 @@ export function createHttpServer(opts: HttpOptions): http.Server {
         if (!bearerHex(req, scope === "companion" ? pairingKey : adminToken)) { send(res, 401, { error: "unauthorized" }); return; }
         // Operator-to-broker calls only. No browser-origin API/CORS credential relay.
         if (req.headers.origin) { send(res, 403, { error: "browser_origin_forbidden" }); return; }
-        if (!opts.sessions) { send(res, 503, { error: "sessions_not_configured" }); return; }
-        const id = sessionRoute[2];
-        const action = sessionRoute[3];
         const token = typeof req.headers["x-safe-connect-session"] === "string" ? req.headers["x-safe-connect-session"] : "";
-        try {
-          if (method === "GET" && id && !action) { send(res, 200, opts.sessions.status(id, token)); return; }
-          if (method !== "POST") { send(res, 405, { error: "method_not_allowed" }); return; }
-          let body: unknown;
-          try { body = JSON.parse(await readBody(req) || "{}"); }
-          catch { send(res, 400, { error: "invalid_request" }); return; }
-          if (!id) {
-            const parsed = z.object({ profile_id: z.string().min(1).max(64) }).strict().safeParse(body);
-            if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
-            send(res, 201, await opts.sessions.create(parsed.data.profile_id)); return;
-          }
-          if (action === "credentials") {
-            const parsed = z.object({ revision: z.number().int().nonnegative(), item_id: z.string().min(1), grade: z.enum(["L0", "L1"]).optional() }).strict().safeParse(body);
-            if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
-            send(res, 200, await opts.sessions.credentials(id, token, parsed.data.revision, parsed.data.item_id, parsed.data.grade)); return;
-          }
-          if (action === "continue") {
-            const parsed = z.object({ revision: z.number().int().nonnegative() }).strict().safeParse(body);
-            if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
-            send(res, 200, await opts.sessions.continue(id, token, parsed.data.revision)); return;
-          }
-          if (action === "cancel") {
-            if (!z.object({}).strict().safeParse(body).success) { send(res, 400, { error: "invalid_request" }); return; }
-            send(res, 200, await opts.sessions.cancel(id, token)); return;
-          }
-          send(res, 404, { error: "not_found" }); return;
-        } catch (err) {
-          // Do not log browser errors, page data, control tokens, or request bodies.
-          send(res, err instanceof SessionError ? err.status : 500, { error: err instanceof SessionError ? err.code : "session_operation_failed" });
-          return;
-        }
+        await dispatchSession(res, req, method, opts.sessions, sessionRoute[2], sessionRoute[3], token, { public: false });
+        return;
       }
 
       if (method === "GET" && url.pathname === "/v1/health") {

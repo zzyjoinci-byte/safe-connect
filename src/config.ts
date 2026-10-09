@@ -7,6 +7,25 @@ export const VERSION = "0.1.0";
 export const GRANT_TTL_MS = 30_000;
 export const HEARTBEAT_STALE_MS = 10_000;
 export const DEFAULT_PORT = 8787;
+export const SESSION_TIMEOUT_MAX_MS = 10 * 60_000;
+export const SESSION_TIMEOUT_DEFAULT_MS = 5 * 60_000;
+export const SESSION_TIMEOUT_HEADED_MS = 10 * 60_000;
+
+export function headedEnabled(): boolean {
+  return process.env.SAFE_CONNECT_HEADED === "1";
+}
+
+export function sessionsEnabled(): boolean {
+  return process.env.SAFE_CONNECT_SESSIONS !== "0";
+}
+
+export function sessionTimeoutMs(): number {
+  const fallback = headedEnabled() ? SESSION_TIMEOUT_HEADED_MS : SESSION_TIMEOUT_DEFAULT_MS;
+  const raw = process.env.SAFE_CONNECT_SESSION_TIMEOUT_MS;
+  const n = raw ? Number(raw) : fallback;
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(n, SESSION_TIMEOUT_MAX_MS);
+}
 
 export interface AppConfig {
   mode: Mode;

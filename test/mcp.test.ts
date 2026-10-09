@@ -11,8 +11,19 @@ before(async () => {
   await cryptoReady();
 });
 
-test("MCP server exposes only login request/status tools", () => {
-  assert.deepEqual([...MCP_TOOLS].sort(), ["get_login_status", "request_browser_login"]);
+test("MCP server exposes login and session tools, never get_password", () => {
+  assert.deepEqual([...MCP_TOOLS].sort(), [
+    "attach_session_credentials",
+    "cancel_login_session",
+    "continue_login_session",
+    "create_login_session",
+    "get_login_status",
+    "get_session_status",
+    "list_session_profiles",
+    "request_browser_login",
+  ]);
+  assert.ok(!MCP_TOOLS.includes("get_password"));
   const broker = new Broker({ mode: "local", filler: mockFiller({}) });
-  createMcpServer(brokerBackend(broker));
+  const server = createMcpServer(brokerBackend(broker));
+  assert.ok(server);
 });

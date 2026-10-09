@@ -27,4 +27,7 @@ test("CLI help explains local vs cloud+companion", async () => {
   assert.match(out, /cloud/);
   assert.match(out, /companion/);
   assert.match(out, /never returns secrets/i);
+  assert.match(out, /session create/);
+  assert.match(out, /app-store-connect/);
+  assert.match(out, /create_login_session/);
 });
