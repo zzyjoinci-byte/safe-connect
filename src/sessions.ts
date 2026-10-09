@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Frame, type Page } from "playwright";
 import type { Broker } from "./broker.js";
-import { fillInput, isolatedWorldCall, selectCredentialFrameId, type FillFrameTarget, type FrameTreeNode } from "./fill.js";
+import { clickVisibleControl, fillInput, visibleInputExists, type FillFrameTarget } from "./fill.js";
 import type { Grade } from "./types.js";
 
 export type SessionState = "opening" | "ready_for_credentials" | "awaiting_grant" | "filling"
@@ -307,26 +307,48 @@ export class ControlledSessions {
             cdp = await r.context!.newCDPSession(r.page!);
             const user = target.locator(r.profile.usernameSelector).first();
             await fillInput(cdp, user, r.profile.usernameSelector, username, r.profile.credentialOrigin, expiresAt, this.fillTarget(r));
-            let passFrame = this.checkFillOrigins(r);
-            let pass = passFrame.locator(r.profile.passwordSelector).first();
-            if (r.profile.usernameNextSelector && !await pass.count()) {
+            this.checkFillOrigins(r);
+            if (r.profile.usernameNextSelector &&
+              !await visibleInputExists(cdp, r.profile.credentialOrigin, r.profile.passwordSelector, expiresAt, this.fillTarget(r))) {
               await this.nextUsername(r, cdp, expiresAt);
-              passFrame = this.checkFillOrigins(r);
-              pass = passFrame.locator(r.profile.passwordSelector).first();
+              if (!await this.waitForVisiblePassword(r, cdp, expiresAt)) {
+                if (Date.now() >= expiresAt - 25) {
+                  await this.end(r, "expired", "credential_deadline");
+                  return { ok: false, error: "controlled_fill_failed" };
+                }
+                this.set(r, "manual_required", "password_field_not_visible");
+                return { ok: false, error: "password_field_not_visible" };
+              }
             }
             this.checkFillOrigins(r);
             if (await this.manual(r)) return { ok: false, error: "manual_required" };
+            if (!await visibleInputExists(cdp, r.profile.credentialOrigin, r.profile.passwordSelector, expiresAt, this.fillTarget(r))) {
+              this.set(r, "manual_required", "password_not_filled");
+              return { ok: false, error: "password_not_filled" };
+            }
+            const passFrame = this.checkFillOrigins(r);
+            const pass = passFrame.locator(r.profile.passwordSelector).first();
             await fillInput(cdp, pass, r.profile.passwordSelector, password, r.profile.credentialOrigin, expiresAt, this.fillTarget(r));
             this.checkFillOrigins(r);
+            if (!await visibleInputExists(cdp, r.profile.credentialOrigin, r.profile.passwordSelector, expiresAt, this.fillTarget(r))) {
+              this.set(r, "manual_required", "password_not_filled");
+              return { ok: false, error: "password_not_filled" };
+            }
             r.credentialsFilled = true;
             this.set(r, "awaiting_user_submit", this.headed ? "local_headed_browser" : "operator_surface_unavailable");
             return { ok: true };
-          } catch {
+          } catch (err) {
+            const code = err instanceof Error ? err.message : "";
             if (!terminal.has(r.state)) {
               // Playwright's bounded wait can win the timer race by a few ms.
               // End early rather than allow that near-expiry operation to retry.
               if (Date.now() >= expiresAt - 25) await this.end(r, "expired", "credential_deadline");
-              else await this.end(r, "blocked", "credential_phase_failed");
+              else if (code === "password_not_filled" || code === "password_field_not_visible" ||
+                code === "username_step_failed" || code === "input_not_visible" || code === "write_not_confirmed") {
+                this.set(r, "manual_required", code === "username_step_failed" ? "username_step_failed" : "password_not_filled");
+              } else {
+                await this.end(r, "blocked", "credential_phase_failed");
+              }
             }
             return { ok: false, error: "controlled_fill_failed" };
           } finally {
@@ -340,7 +362,9 @@ export class ControlledSessions {
         },
       });
       r.requestId = result.request_id;
-      if (result.status === "denied" || result.status === "expired") await this.end(r, "blocked", "credential_request_denied");
+      if ((result.status === "denied" || result.status === "expired") && stillInCredentialPhase(r)) {
+        await this.end(r, "blocked", "credential_request_denied");
+      }
       return this.view(r);
     } finally { r.busy = false; }
   }
@@ -389,16 +413,28 @@ export class ControlledSessions {
 
   private async nextUsername(r: RecordState, cdp: CDPSession, expiresAt: number): Promise<void> {
     this.checkFillOrigins(r);
-    const { frameTree } = await cdp.send("Page.getFrameTree");
-    const frameId = selectCredentialFrameId(frameTree as FrameTreeNode, r.profile.credentialOrigin, this.fillTarget(r));
-    const result = await isolatedWorldCall(cdp, frameId, `function(origin, selector, passwordSelector, expiresAt) {
-        if (location.origin !== origin || Date.now() >= expiresAt) return false;
-        if (document.querySelector(passwordSelector)) return false;
-        const button = document.querySelector(selector);
-        if (!(button instanceof HTMLElement)) return false;
-        button.click(); return true;
-      }`, [r.profile.credentialOrigin, r.profile.usernameNextSelector, r.profile.passwordSelector, expiresAt]);
-    if (result !== true) throw new SessionError("username_step_failed");
+    while (Date.now() < expiresAt) {
+      this.ensureActive(r);
+      const result = await clickVisibleControl(
+        cdp, r.profile.credentialOrigin, r.profile.usernameNextSelector ?? "", expiresAt, this.fillTarget(r),
+      );
+      if (result === true) return;
+      if (result === false) throw new SessionError("username_step_failed");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new SessionError("username_step_failed");
+  }
+
+  private async waitForVisiblePassword(r: RecordState, cdp: CDPSession, expiresAt: number): Promise<boolean> {
+    while (Date.now() < expiresAt) {
+      this.ensureActive(r);
+      this.checkFillOrigins(r);
+      if (await visibleInputExists(cdp, r.profile.credentialOrigin, r.profile.passwordSelector, expiresAt, this.fillTarget(r))) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
   }
 
   private async manual(r: RecordState): Promise<boolean> {
@@ -546,6 +582,10 @@ export class ControlledSessions {
       ...(r.requestId ? { request_id: r.requestId } : {}), ...(r.reason ? { reason: r.reason } : {}),
       operator_surface: this.headed ? "local_headed_browser" : "unavailable" };
   }
+}
+
+function stillInCredentialPhase(r: { state: SessionState }): boolean {
+  return r.state === "awaiting_grant" || r.state === "filling";
 }
 
 function matchSuccessPath(current: URL, success: LoginProfile["success"]): boolean {

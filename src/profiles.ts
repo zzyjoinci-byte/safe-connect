@@ -3,12 +3,12 @@ import type { LoginProfile } from "./sessions.js";
 /**
  * Built-in App Store Connect profile.
  *
- * Selectors come from Apple's long-standing idmsa auth widget (account name
- * field, #sign-in continue, password field) embedded in
- * `#aid-auth-widget-iFrame` from https://idmsa.apple.com on
- * https://appstoreconnect.apple.com/login. They are best-effort and have not
- * been verified against a live Apple account in this repository. Override with
- * SAFE_CONNECT_ASC_* environment variables if Apple's DOM shifts.
+ * Selectors target Apple's idmsa widget inside `#aid-auth-widget-iFrame` on
+ * https://appstoreconnect.apple.com/login. A live headed run showed the Apple ID
+ * field still accepts `#account_name_text_field`, while the current step-1
+ * control is a visible full-width "Continue" button (historically `#sign-in`).
+ * The password field may exist hidden in the DOM until Continue; fills require
+ * a visible password input. Override with SAFE_CONNECT_ASC_* if the DOM shifts.
  */
 export const APP_STORE_CONNECT_PROFILE_ID = "app-store-connect";
 
@@ -41,8 +41,14 @@ export function appStoreConnectProfile(): LoginProfile {
     credentialOrigin: APPLE_IDMSA,
     credentialFrame: "direct-child",
     usernameSelector: selectorEnv("SAFE_CONNECT_ASC_USERNAME_SELECTOR", "#account_name_text_field"),
-    usernameNextSelector: selectorEnv("SAFE_CONNECT_ASC_NEXT_SELECTOR", "#sign-in"),
-    passwordSelector: selectorEnv("SAFE_CONNECT_ASC_PASSWORD_SELECTOR", "#password_text_field"),
+    usernameNextSelector: selectorEnv(
+      "SAFE_CONNECT_ASC_NEXT_SELECTOR",
+      "#sign-in, button[type='submit'], #continue-password, button.si-button",
+    ),
+    passwordSelector: selectorEnv(
+      "SAFE_CONNECT_ASC_PASSWORD_SELECTOR",
+      "#password_text_field, input[type='password']",
+    ),
     success: {
       origin: APPLE_PORTAL,
       pathnamePrefix: "/",
