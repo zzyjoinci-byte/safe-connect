@@ -278,6 +278,7 @@ async function cmdCompanion(flags: Flags): Promise<void> {
 
 async function approveChallenge(ch: UnwrapChallenge, auto: boolean): Promise<boolean> {
   console.log("");
+  if (ch.session_id) console.log(`Controlled session: ${ch.session_id} (credential phase only; no final submit)`);
   console.log("=== Safe Connect unwrap challenge ===");
   console.log(`request_id : ${ch.request_id}`);
   console.log(`url        : ${ch.url}`);

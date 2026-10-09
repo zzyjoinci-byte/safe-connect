@@ -6,6 +6,7 @@ import { createGrant, decryptItem, openGrant, zeroizeCredential } from "./grants
 import { logInfo } from "./logger.js";
 import type {
   CompanionStatus,
+  ControlledFill,
   CryptoGrant,
   Filler,
   HealthBody,
@@ -35,7 +36,6 @@ interface PendingChallenge {
   sealed_dek: string;
   nonce: string;
   ciphertext: string;
-  consumeL0: boolean;
   waiter: {
     resolve: (grant: CryptoGrant) => void;
     reject: (err: Error) => void;
@@ -173,6 +173,15 @@ export class Broker {
   }
 
   async requestBrowserLogin(input: LoginRequestInput): Promise<LoginRequestView> {
+    return this.requestLogin(input);
+  }
+
+  /** Trusted controller only; never select a filler from an agent HTTP payload. */
+  async requestControlledLogin(input: LoginRequestInput, controlled: ControlledFill): Promise<LoginRequestView> {
+    return this.requestLogin(input, controlled);
+  }
+
+  private async requestLogin(input: LoginRequestInput, controlled?: ControlledFill): Promise<LoginRequestView> {
     if (this.mode === "cloud" && this.companionStatus() !== "paired") {
       const request_id = randomUUID();
       const rec: LoginRequestRecord = {
@@ -221,8 +230,17 @@ export class Broker {
       created_at: this.now(),
       grant_expires_at: this.now() + ttl,
       confirm_code: confirmCode(),
+      session_id: controlled?.sessionId,
     };
     this.requests.set(request_id, rec);
+
+    // Resolution and consumption run synchronously, before any fill or grant wait.
+    // A failed/denied attempt still burns L0; never restore a consumed credential.
+    if (resolved.grade === "L0" && !this.ephemeral.consume(resolved.id)) {
+      rec.status = "denied";
+      rec.error = "item_not_found";
+      return viewOf(rec);
+    }
 
     if (this.mode === "local") {
       if (resolved.kind !== "local-plain") {
@@ -230,7 +248,7 @@ export class Broker {
         rec.error = "bad_item";
         return viewOf(rec);
       }
-      void this.runLocalFill(rec, resolved).catch((err) => {
+      void this.runLocalFill(rec, resolved, controlled).catch((err) => {
         rec.status = "denied";
         rec.error = "fill_failed";
         logInfo(`local fill error: ${err instanceof Error ? err.message : "unknown"}`);
@@ -243,7 +261,7 @@ export class Broker {
       rec.error = "bad_item";
       return viewOf(rec);
     }
-    void this.runCloudFill(rec, resolved, ttl).catch((err) => {
+    void this.runCloudFill(rec, resolved, ttl, controlled).catch((err) => {
       if (rec.status === "pending") {
         rec.status = "denied";
         rec.error = err instanceof Error ? sanitizeErr(err.message) : "denied";
@@ -265,6 +283,7 @@ export class Broker {
         expires_in: Math.max(0, Math.ceil((ch.record.grant_expires_at - this.now()) / 1000)),
         confirm_code: ch.record.confirm_code ?? "",
         sealed_dek: ch.sealed_dek,
+        ...(ch.record.session_id ? { session_id: ch.record.session_id } : {}),
       });
     }
     return out;
@@ -315,16 +334,17 @@ export class Broker {
     grade?: "L0" | "L1",
   ):
     | { id: string; grade: "L0" | "L1"; kind: "local-plain"; username: string; password: string }
-    | { id: string; grade: "L0" | "L1"; kind: "sealed"; sealed_dek: string; nonce: string; ciphertext: string; consumeL0: boolean }
+    | { id: string; grade: "L0" | "L1"; kind: "sealed"; sealed_dek: string; nonce: string; ciphertext: string }
     | undefined {
     if (this.mode === "local") {
       if (itemId) {
+        const l0item = this.ephemeral.get(itemId);
         const l0 = this.ephemeral.getPlain(itemId);
-        if (l0) {
+        if (l0 && l0item && matchesOrigin(l0item.origin, origin)) {
           return { id: itemId, grade: "L0", kind: "local-plain", ...l0 };
         }
         const l1 = this.localVault?.get(itemId);
-        if (l1) {
+        if (l1 && matchesOrigin(l1.origin, origin)) {
           return { id: l1.id, grade: "L1", kind: "local-plain", username: l1.username, password: l1.password };
         }
         return undefined;
@@ -349,7 +369,7 @@ export class Broker {
       ? this.ephemeral.get(itemId) ?? this.cloudVault?.get(itemId)
       : (grade !== "L1" ? this.ephemeral.findByOrigin(origin) : undefined) ??
         (grade !== "L0" ? this.cloudVault?.findByOrigin(origin) : undefined);
-    if (!sealed) return undefined;
+    if (!sealed || !matchesOrigin(sealed.origin, origin)) return undefined;
     return {
       id: sealed.id,
       grade: sealed.grade,
@@ -357,18 +377,18 @@ export class Broker {
       sealed_dek: sealed.sealed.sealed_dek,
       nonce: sealed.sealed.nonce,
       ciphertext: sealed.sealed.ciphertext,
-      consumeL0: sealed.grade === "L0",
     };
   }
 
   private async runLocalFill(
     rec: LoginRequestRecord,
     resolved: { id: string; grade: "L0" | "L1"; kind: "local-plain"; username: string; password: string },
+    controlled?: ControlledFill,
   ): Promise<void> {
-    const result = await this.filler(rec.url, resolved.username, resolved.password);
-    if (resolved.grade === "L0") {
-      this.ephemeral.consume(resolved.id);
-    }
+    const result = controlled
+      ? await controlled.fill({ request_id: rec.request_id, url: rec.url, expires_at: rec.grant_expires_at }, resolved.username, resolved.password)
+      : await this.filler(rec.url, resolved.username, resolved.password);
+    if (controlled && rec.status !== "pending") return;
     rec.status = result.ok ? "filled" : "denied";
     rec.error = result.ok ? undefined : result.error ?? "fill_failed";
   }
@@ -382,9 +402,9 @@ export class Broker {
       sealed_dek: string;
       nonce: string;
       ciphertext: string;
-      consumeL0: boolean;
     },
     ttl: number,
+    controlled?: ControlledFill,
   ): Promise<void> {
     if (!this.pairing) throw new Error("pairing material missing");
     const grant = await new Promise<CryptoGrant>((resolve, reject) => {
@@ -399,7 +419,6 @@ export class Broker {
         sealed_dek: resolved.sealed_dek,
         nonce: resolved.nonce,
         ciphertext: resolved.ciphertext,
-        consumeL0: resolved.consumeL0,
         waiter: { resolve, reject, timer },
       });
     }).catch((err: Error) => {
@@ -429,12 +448,12 @@ export class Broker {
         consumed: this.consumedGrants,
       });
       cred = decryptItem(dek, resolved.nonce, resolved.ciphertext);
-      const result = await this.filler(rec.url, cred.username, cred.password);
+      const result = controlled
+        ? await controlled.fill({ request_id: rec.request_id, url: rec.url, expires_at: Math.min(rec.grant_expires_at, grant.expires_at) }, cred.username, cred.password)
+        : await this.filler(rec.url, cred.username, cred.password);
+      if (controlled && rec.status !== "pending") return;
       rec.status = result.ok ? "filled" : "denied";
       rec.error = result.ok ? undefined : result.error ?? "fill_failed";
-      if (resolved.consumeL0) {
-        this.ephemeral.consume(resolved.id);
-      }
     } catch (err) {
       rec.status = "denied";
       rec.error = sanitizeErr(err instanceof Error ? err.message : "unwrap_failed");
@@ -454,6 +473,14 @@ export class Broker {
         this.challenges.delete(rec.request_id);
       }
     }
+  }
+}
+
+function matchesOrigin(storedOrigin: string, requestOrigin: string): boolean {
+  try {
+    return requestOrigin !== "null" && originOf(storedOrigin) === requestOrigin;
+  } catch {
+    return false;
   }
 }
 
