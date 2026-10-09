@@ -55,8 +55,8 @@ Id `app-store-connect`. Opt-in by creating a session with that profile id.
 | Credential origin | `https://idmsa.apple.com` |
 | Frame | `direct-child` (Apple's `#aid-auth-widget-iFrame` widget) |
 | Username | `#account_name_text_field` |
-| Continue (not final submit) | `#sign-in` when the password field is absent |
-| Password | `#password_text_field` |
+| Continue (not final submit) | `#sign-in`, `button[type=submit]`, or a visible `Continue`/`Next` button, only when no **visible** password field exists |
+| Password | `#password_text_field` or `input[type=password]`, must be visible |
 | Success | Top-level `https://appstoreconnect.apple.com`, not `/login`, marker `a[href='/apps']` or `a[href^='/apps/']` |
 | Manual | 2FA/OTP, passkey, and CAPTCHA selectors on `idmsa.apple.com` |
 
@@ -90,10 +90,12 @@ Final Sign In and the 2FA code stay manual (`awaiting_user_submit` /
    fails authenticated decryption. Sessions never retain a grant for replay.
 4. After grant verification, the same broker decrypts and calls the controlled
    filler in that session's existing context. It fills username, optionally clicks
-   the configured username-only Next button if no password field exists, and
-   fills password. Each write uses the isolated-world origin check in the
-   selected frame. The Next action also checks origin and deadline and refuses
-   to run when the configured password field is present.
+   the configured username-only Next/Continue button if no **visible** password
+   field exists (attached-but-hidden fields do not skip Continue), waits for a
+   visible password input, and fills it. Each write uses the isolated-world origin
+   and visibility check in the selected frame. `awaiting_user_submit` is set only
+   after that visible password write succeeds; otherwise the session reports
+   `manual_required` with `password_not_filled` / `password_field_not_visible`.
 5. The phase deadline is the earliest of the request expiry, signed grant expiry,
    session expiry and 30 seconds after phase entry. Expiry/cancellation closes the
    context and prevents subsequent writes. The phase returns immediately after

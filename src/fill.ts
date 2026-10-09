@@ -127,26 +127,109 @@ export async function isolatedWorldCall(
   return result.result.value;
 }
 
+function waitMs(expiresAt?: number): number {
+  return expiresAt ? Math.max(1, Math.min(5_000, expiresAt - Date.now())) : 5_000;
+}
+
+async function credentialFrameId(session: CDPSession, expectedOrigin: string, target: FillFrameTarget): Promise<string> {
+  const { frameTree } = await session.send("Page.getFrameTree");
+  return selectCredentialFrameId(frameTree as FrameTreeNode, expectedOrigin, target);
+}
+
+/** Isolated-world visibility: attached-but-hidden fields are not fill or click targets. */
+const VISIBLE = `const visible = (el) => {
+  if (!(el instanceof HTMLElement) || el.hidden) return false;
+  if ((el instanceof HTMLButtonElement || el instanceof HTMLInputElement) && el.disabled) return false;
+  if (el instanceof HTMLInputElement && el.readOnly) return false;
+  if (el.getAttribute("aria-hidden") === "true") return false;
+  if (typeof el.checkVisibility === "function") {
+    try { if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false; } catch (e) {}
+  }
+  const style = getComputedStyle(el);
+  if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+};`;
+
+export async function visibleInputExists(
+  session: CDPSession, expectedOrigin: string, selector: string, expiresAt: number, target: FillFrameTarget = "top",
+): Promise<boolean> {
+  const frameId = await credentialFrameId(session, expectedOrigin, target);
+  const result = await isolatedWorldCall(session, frameId, `function(origin, selector, expiresAt) {
+      ${VISIBLE}
+      if (Date.now() >= expiresAt || location.origin !== origin) return false;
+      for (const el of document.querySelectorAll(selector)) {
+        if (el instanceof HTMLInputElement && visible(el)) return true;
+      }
+      return false;
+    }`, [expectedOrigin, selector, expiresAt]);
+  return result === true;
+}
+
+export async function clickVisibleControl(
+  session: CDPSession, expectedOrigin: string, selector: string, expiresAt: number, target: FillFrameTarget = "top",
+): Promise<true | "disabled" | false> {
+  const frameId = await credentialFrameId(session, expectedOrigin, target);
+  const result = await isolatedWorldCall(session, frameId, `function(origin, selector, expiresAt) {
+      ${VISIBLE}
+      if (Date.now() >= expiresAt || location.origin !== origin) return false;
+      const candidates = [];
+      for (const el of document.querySelectorAll(selector)) candidates.push(el);
+      for (const el of document.querySelectorAll("button, input[type=submit], [role=button]")) {
+        const text = ((el instanceof HTMLInputElement ? el.value : el.textContent) || "").replace(/\\s+/g, " ").trim();
+        if (/^(Continue|Next)$/i.test(text)) candidates.push(el);
+      }
+      let disabled = false;
+      for (const el of candidates) {
+        if (!(el instanceof HTMLElement)) continue;
+        const isDisabled = (el instanceof HTMLButtonElement || el instanceof HTMLInputElement) && el.disabled;
+        const shown = (() => {
+          if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
+          if (typeof el.checkVisibility === "function") {
+            try { if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false; } catch (e) {}
+          }
+          const style = getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        })();
+        if (!shown) continue;
+        if (isDisabled) { disabled = true; continue; }
+        el.click();
+        return true;
+      }
+      return disabled ? "disabled" : false;
+    }`, [expectedOrigin, selector, expiresAt]);
+  if (result === true || result === "disabled") return result;
+  return false;
+}
+
 export async function fillInput(session: CDPSession, locator: Locator, selector: string,
   value: string, expectedOrigin: string, expiresAt?: number, target: FillFrameTarget = "top"): Promise<void> {
-  await locator.waitFor({ state: "attached", timeout: expiresAt ? Math.max(1, Math.min(5_000, expiresAt - Date.now())) : 5_000 });
-  const { frameTree } = await session.send("Page.getFrameTree");
-  const frameId = selectCredentialFrameId(frameTree as FrameTreeNode, expectedOrigin, target);
+  await locator.waitFor({ state: "visible", timeout: waitMs(expiresAt) });
+  const frameId = await credentialFrameId(session, expectedOrigin, target);
   // Check and write synchronously in an isolated, document-bound context.
   // Navigation destroys the context instead of retargeting the write. Isolation
   // also prevents page scripts from replacing eval/DOM getters to steal args or
   // forge an origin check. Never grant this world universal cross-origin access.
+  // Only the first *visible* matching input is written; hidden fields are not targets.
   const result = await isolatedWorldCall(session, frameId, `function(selector, value, expectedOrigin, expiresAt) {
+      ${VISIBLE}
       if (expiresAt !== null && Date.now() >= expiresAt) return "grant_expired";
       if (location.origin !== expectedOrigin) return "origin_mismatch";
-      const element = document.querySelector(selector);
-      if (!(element instanceof HTMLInputElement) || element.disabled || element.readOnly) {
-        return "input_not_editable";
+      let element = null;
+      for (const el of document.querySelectorAll(selector)) {
+        if (el instanceof HTMLInputElement && visible(el)) { element = el; break; }
       }
+      if (!(element instanceof HTMLInputElement) || !visible(element)) return "input_not_visible";
       const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+      element.focus();
       setValue.call(element, value);
       element.dispatchEvent(new Event("input", { bubbles: true }));
+      try { element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromPaste" })); } catch (e) {}
       element.dispatchEvent(new Event("change", { bubbles: true }));
+      element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
+      if (!visible(element) || element.value !== value) return "write_not_confirmed";
       return null;
     }`, [selector, value, expectedOrigin, expiresAt ?? null]);
   if (result !== null) throw new Error((result as string | null) ?? "fill_failed");

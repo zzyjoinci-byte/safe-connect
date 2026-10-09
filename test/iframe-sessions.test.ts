@@ -50,6 +50,8 @@ async function setup(t: TestContext, opts: {
   iframe?: IframeKind;
   delayedPassword?: boolean;
   trapInputs?: boolean;
+  hiddenPasswordUntilContinue?: boolean;
+  continueKind?: "id" | "label-only" | "none";
 } = {}) {
   const home = testHome("safe-connect-iframe-");
   const portal = await listenOrigin();
@@ -102,6 +104,32 @@ async function setup(t: TestContext, opts: {
       return `<form><input id="username" name="username"><input id="password" name="password" type="password"></form>${report}`;
     }
     if (route === "/login") {
+      if (opts.hiddenPasswordUntilContinue) {
+        const continueBtn = opts.continueKind === "none"
+          ? ""
+          : opts.continueKind === "label-only"
+            ? '<button type="button">Continue</button>'
+            : '<button id="next" type="button">Continue</button>';
+        return `<form method="post" action="/password">
+          <input id="username" name="username" placeholder="Email or Phone Number">
+          <input id="password" name="password" type="password" style="display:none" aria-hidden="true">
+          ${continueBtn}
+          <button id="submit" type="submit" style="display:none">Sign in</button>
+        </form>
+        <script>
+          document.querySelectorAll("button").forEach((btn) => {
+            if (btn.id === "submit") return;
+            btn.addEventListener("click", (event) => {
+              event.preventDefault();
+              const password = document.getElementById("password");
+              password.style.display = "block";
+              password.removeAttribute("aria-hidden");
+              document.getElementById("submit").style.display = "block";
+              btn.style.display = "none";
+            });
+          });
+        </script>${report}`;
+      }
       return `<form method="post" action="/username"><input id="username" name="username"><button id="next" type="submit">Continue</button></form>${report}`;
     }
     if (route === "/password") {
@@ -177,7 +205,7 @@ async function setup(t: TestContext, opts: {
     credentialFrame: "direct-child",
     usernameSelector: "#username",
     passwordSelector: "#password",
-    usernameNextSelector: "#next",
+    usernameNextSelector: opts.continueKind === "label-only" ? "#sign-in" : "#next",
     success: { origin: portal.origin, pathname: "/dashboard", selector: "#authenticated" },
     manual: [{ origin: idp.origin, selector: "#otp-challenge", kind: "otp" }],
   };
@@ -328,6 +356,45 @@ test("public session APIs never disclose control_token and list the Apple profil
   assert.equal(cancelled.json.state, "cancelled");
 });
 
+test("hidden password is not treated as present; Continue must reveal it before awaiting_user_submit", async (t) => {
+  const f = await setup(t, { hiddenPasswordUntilContinue: true });
+  const s = await f.sessions.create("synthetic-iframe");
+  assert.equal(s.state, "ready_for_credentials");
+  await f.sessions.credentials(s.session_id, s.control_token, s.revision, f.itemId);
+  const state = () => f.sessions.status(s.session_id, s.control_token);
+  await until(() => state().state === "awaiting_user_submit");
+  const idpFrame = f.page().frames().find((frame) => frame.url().startsWith(f.idp))!;
+  assert.equal(await idpFrame.locator("#password").isVisible(), true);
+  assert.equal(await idpFrame.locator("#password").inputValue(), fakePass);
+  assert.equal(await idpFrame.locator("#submit").isVisible(), true);
+  assert.deepEqual(f.counts(), { submittedPasswords: 0, completedOtp: 0 });
+  assert.notEqual(state().state, "authenticated");
+});
+
+test("Continue labeled button is clicked even when the configured id is absent", async (t) => {
+  const f = await setup(t, { hiddenPasswordUntilContinue: true, continueKind: "label-only" });
+  const s = await f.sessions.create("synthetic-iframe");
+  await f.sessions.credentials(s.session_id, s.control_token, s.revision, f.itemId);
+  const state = () => f.sessions.status(s.session_id, s.control_token);
+  await until(() => state().state === "awaiting_user_submit");
+  const idpFrame = f.page().frames().find((frame) => frame.url().startsWith(f.idp))!;
+  assert.equal(await idpFrame.locator("#password").inputValue(), fakePass);
+  assert.equal(f.counts().submittedPasswords, 0);
+});
+
+test("hidden password without Continue never reports awaiting_user_submit", async (t) => {
+  const f = await setup(t, { hiddenPasswordUntilContinue: true, continueKind: "none" });
+  const s = await f.sessions.create("synthetic-iframe");
+  await f.sessions.credentials(s.session_id, s.control_token, s.revision, f.itemId);
+  const state = () => f.sessions.status(s.session_id, s.control_token);
+  await until(() => ["manual_required", "blocked", "expired"].includes(state().state));
+  assert.notEqual(state().state, "awaiting_user_submit");
+  assert.equal(state().reason === "password_not_filled" || state().reason === "password_field_not_visible"
+    || state().reason === "username_step_failed" || state().reason === "credential_phase_failed", true, state().reason);
+  assert.ok(!f.idpCaptured().join("").includes(fakePass));
+  assert.equal(f.counts().submittedPasswords, 0);
+});
+
 test("built-in Apple profile is exact-origin, iframe, and selector-overridable", () => {
   const profile = appStoreConnectProfile();
   assert.equal(profile.id, APP_STORE_CONNECT_PROFILE_ID);
@@ -336,8 +403,9 @@ test("built-in Apple profile is exact-origin, iframe, and selector-overridable",
   assert.equal(profile.credentialOrigin, "https://idmsa.apple.com");
   assert.equal(profile.credentialFrame, "direct-child");
   assert.equal(profile.usernameSelector, "#account_name_text_field");
-  assert.equal(profile.passwordSelector, "#password_text_field");
-  assert.equal(profile.usernameNextSelector, "#sign-in");
+  assert.match(profile.passwordSelector ?? "", /#password_text_field/);
+  assert.match(profile.usernameNextSelector ?? "", /#sign-in/);
+  assert.match(profile.usernameNextSelector ?? "", /button\[type='submit'\]/);
   assert.equal(profile.success.origin, "https://appstoreconnect.apple.com");
   assert.ok(profile.success.denyPathnames?.includes("/login"));
   assert.deepEqual(builtinProfiles().map((p) => p.id), [APP_STORE_CONNECT_PROFILE_ID]);
