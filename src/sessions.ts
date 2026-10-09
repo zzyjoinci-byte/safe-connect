@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type CDPSession, type Frame, type Page } from "playwright";
 import type { Broker } from "./broker.js";
-import { fillInput } from "./fill.js";
+import { fillInput, isolatedWorldCall, selectCredentialFrameId, type FillFrameTarget, type FrameTreeNode } from "./fill.js";
 import type { Grade } from "./types.js";
 
 export type SessionState = "opening" | "ready_for_credentials" | "awaiting_grant" | "filling"
@@ -11,14 +11,29 @@ export type SessionState = "opening" | "ready_for_credentials" | "awaiting_grant
 export interface LoginProfile {
   id: string;
   entryUrl: string;
+  /** Exact top-level portal origin. Defaults to origin(entryUrl). */
+  portalOrigin?: string;
   credentialOrigin: string;
+  /**
+   * `direct-child` fills the unique child frame whose origin equals credentialOrigin,
+   * while the top-level page must stay on portalOrigin. Nested frames are never a target.
+   */
+  credentialFrame?: "direct-child";
   usernameSelector: string;
   passwordSelector: string;
   /** Optional username-only Next button. Never a final password/OTP submit button. */
   usernameNextSelector?: string;
-  success: { origin: string; pathname: string; selector: string };
+  success: {
+    origin: string;
+    pathname?: string;
+    pathnamePrefix?: string;
+    denyPathnames?: string[];
+    selector: string;
+  };
   manual?: Array<{ origin: string; selector: string; kind: "otp" | "captcha" | "passkey" }>;
 }
+
+export type OperatorSurface = "unavailable" | "local_headed_browser";
 
 export interface SessionView {
   session_id: string;
@@ -28,8 +43,16 @@ export interface SessionView {
   expires_at: number;
   request_id?: string;
   reason?: string;
-  /** No browser handoff is implemented by these control APIs. */
-  operator_surface: "unavailable";
+  /** Headed local Chromium when SAFE_CONNECT_HEADED=1; never a remote browser handoff. */
+  operator_surface: OperatorSurface;
+}
+
+export interface ProfileView {
+  id: string;
+  entry_url: string;
+  portal_origin: string;
+  credential_origin: string;
+  credential_frame: FillFrameTarget;
 }
 
 interface RecordState {
@@ -64,7 +87,14 @@ export interface SessionOptions {
   sessionTimeoutMs?: number;
   retentionMs?: number;
   maxSessions?: number;
+  /** How long create() waits for a direct child credential frame. */
+  credentialFrameTimeoutMs?: number;
+  /** Visible Chromium on the existing DISPLAY. Not a remote operator UI. */
+  headed?: boolean;
 }
+
+/** Lookup by session_id only (agent HTTP/MCP). Operator APIs still require the control token. */
+export const PUBLIC_SESSION = null;
 
 const terminal = new Set<SessionState>(["blocked", "cancelled", "expired"]);
 const hash = (token: string) => createHash("sha256").update(token).digest();
@@ -92,24 +122,43 @@ export class ControlledSessions {
   private readonly sessionTimeoutMs: number;
   private readonly retentionMs: number;
   private readonly maxSessions: number;
+  private readonly headed: boolean;
+  private readonly credentialFrameTimeoutMs: number;
   private readonly watchdog: ReturnType<typeof setInterval>;
 
   constructor(private readonly options: SessionOptions) {
     this.sessionTimeoutMs = options.sessionTimeoutMs ?? 5 * 60_000;
     this.retentionMs = options.retentionMs ?? 60_000;
     this.maxSessions = options.maxSessions ?? 8;
+    this.credentialFrameTimeoutMs = options.credentialFrameTimeoutMs ?? 10_000;
+    this.headed = options.headed ?? process.env.SAFE_CONNECT_HEADED === "1";
     if (!(this.sessionTimeoutMs > 0 && this.sessionTimeoutMs <= 10 * 60_000) ||
       !(this.retentionMs > 0 && this.retentionMs <= 5 * 60_000) ||
+      !(this.credentialFrameTimeoutMs > 0 && this.credentialFrameTimeoutMs <= 15_000) ||
       !Number.isInteger(this.maxSessions) || this.maxSessions < 1 || this.maxSessions > 32) {
       throw new SessionError("invalid_limits", 400);
     }
     for (const raw of options.profiles) {
       const p = structuredClone(raw);
       if (!/^[a-zA-Z0-9_-]{1,64}$/.test(p.id) || this.profiles.has(p.id)) throw new SessionError("invalid_profile", 400);
-      origin(p.entryUrl);
+      const entryOrigin = origin(p.entryUrl);
+      p.portalOrigin = p.portalOrigin ? exactOrigin(p.portalOrigin) : entryOrigin;
+      if (p.portalOrigin !== entryOrigin) throw new SessionError("invalid_profile", 400);
       exactOrigin(p.credentialOrigin);
       exactOrigin(p.success.origin);
-      if (!p.success.pathname.startsWith("/") || /[?#]/.test(p.success.pathname)) throw new SessionError("invalid_profile", 400);
+      if (p.credentialFrame && p.credentialFrame !== "direct-child") throw new SessionError("invalid_profile", 400);
+      if (p.credentialFrame === "direct-child" && p.credentialOrigin === p.portalOrigin) {
+        throw new SessionError("invalid_profile", 400);
+      }
+      const hasPath = typeof p.success.pathname === "string" && p.success.pathname.startsWith("/") && !/[?#]/.test(p.success.pathname);
+      const hasPrefix = typeof p.success.pathnamePrefix === "string" && p.success.pathnamePrefix.startsWith("/") &&
+        !/[?#]/.test(p.success.pathnamePrefix);
+      if (p.success.pathname !== undefined && !hasPath) throw new SessionError("invalid_profile", 400);
+      if (p.success.pathnamePrefix !== undefined && !hasPrefix) throw new SessionError("invalid_profile", 400);
+      if (!hasPath && !hasPrefix) throw new SessionError("invalid_profile", 400);
+      for (const deny of p.success.denyPathnames ?? []) {
+        if (!deny.startsWith("/") || /[?#]/.test(deny) || deny.length > 512) throw new SessionError("invalid_profile", 400);
+      }
       const selectors = [p.usernameSelector, p.passwordSelector, p.success.selector, p.usernameNextSelector ?? "x"];
       for (const m of p.manual ?? []) { exactOrigin(m.origin); selectors.push(m.selector); }
       if (selectors.some((s) => !s || s.length > 512)) throw new SessionError("invalid_profile", 400);
@@ -119,6 +168,16 @@ export class ControlledSessions {
       for (const record of this.records.values()) this.guard(record);
     }, 250);
     this.watchdog.unref();
+  }
+
+  listProfiles(): ProfileView[] {
+    return [...this.profiles.values()].map((p) => ({
+      id: p.id,
+      entry_url: p.entryUrl,
+      portal_origin: p.portalOrigin ?? origin(p.entryUrl),
+      credential_origin: p.credentialOrigin,
+      credential_frame: p.credentialFrame ?? "top",
+    }));
   }
 
   async create(profileId: string): Promise<SessionView & { control_token: string }> {
@@ -133,9 +192,10 @@ export class ControlledSessions {
       if (old) this.records.delete(old.id);
     }
     const token = randomBytes(32).toString("hex");
+    const portalOrigin = profile.portalOrigin ?? origin(profile.entryUrl);
     const r: RecordState = {
       id: randomUUID(), tokenHash: hash(token), profile,
-      origins: new Set([origin(profile.entryUrl), profile.credentialOrigin, profile.success.origin,
+      origins: new Set([portalOrigin, profile.credentialOrigin, profile.success.origin,
         ...(profile.manual ?? []).map((m) => m.origin)]),
       state: "opening", revision: 0, expiresAt: Date.now() + this.sessionTimeoutMs,
       credentialsFilled: false, credentialStarted: false, busy: false,
@@ -143,7 +203,7 @@ export class ControlledSessions {
     this.records.set(r.id, r);
     this.armExpiry(r);
     try {
-      this.browser ??= (this.options.browserFactory ?? (() => chromium.launch({ headless: true })))();
+      this.browser ??= (this.options.browserFactory ?? (() => chromium.launch({ headless: !this.headed })))();
       const b = await this.browser;
       this.ensureActive(r);
       const context = await b.newContext({ acceptDownloads: false, serviceWorkers: "block" });
@@ -157,28 +217,51 @@ export class ControlledSessions {
       context.on("close", () => { if (!terminal.has(r.state)) void this.end(r, "cancelled", "browser_closed"); });
       page.on("download", (download) => { void download.cancel(); void this.end(r, "blocked", "download_not_supported"); });
       page.on("framenavigated", (frame) => {
-        if (frame.url() === "about:blank") return;
+        if (frame.url() === "about:blank" || frame !== page.mainFrame()) return;
         try {
           const current = origin(frame.url());
-          if (!r.origins.has(current) || (r.state === "filling" && current !== profile.credentialOrigin)) {
+          if (!r.origins.has(current)) {
+            void this.end(r, "blocked", "origin_mismatch");
+            return;
+          }
+          if (r.state === "filling" && current !== this.expectedTopOrigin(r)) {
             void this.end(r, "blocked", "origin_mismatch");
           }
         } catch { void this.end(r, "blocked", "origin_mismatch"); }
       });
       await context.route("**/*", async (route) => {
         try {
-          if (terminal.has(r.state) || !r.origins.has(origin(route.request().url()))) {
-            await route.abort();
-            void this.end(r, "blocked", "origin_mismatch");
-            return;
+          if (terminal.has(r.state)) { await route.abort(); return; }
+          const req = route.request();
+          const isMainDocument = req.resourceType() === "document" && req.frame() === page.mainFrame();
+          if (isMainDocument) {
+            let reqOrigin: string;
+            try { reqOrigin = origin(req.url()); }
+            catch {
+              await route.abort();
+              void this.end(r, "blocked", "origin_mismatch");
+              return;
+            }
+            if (!r.origins.has(reqOrigin)) {
+              await route.abort();
+              void this.end(r, "blocked", "origin_mismatch");
+              return;
+            }
           }
           await route.continue();
         } catch { if (!terminal.has(r.state)) void this.end(r, "blocked", "navigation_failed"); }
       });
       await page.goto(profile.entryUrl, { waitUntil: "domcontentloaded", timeout: Math.min(15_000, this.sessionTimeoutMs) });
       this.ensureActive(r);
-      if (origin(page.url()) !== profile.credentialOrigin) this.set(r, "manual_required", "credential_origin_not_reached");
-      else if (!await this.manual(r)) this.set(r, "ready_for_credentials");
+      const top = origin(page.url());
+      if (profile.credentialFrame === "direct-child") {
+        if (top !== portalOrigin) this.set(r, "manual_required", "credential_origin_not_reached");
+        else if (!await this.waitForDirectChild(r, profile.credentialOrigin, Math.min(this.credentialFrameTimeoutMs, this.sessionTimeoutMs))) {
+          this.set(r, "manual_required", "credential_origin_not_reached");
+        } else if (!await this.manual(r)) this.set(r, "ready_for_credentials");
+      } else if (top !== profile.credentialOrigin) {
+        this.set(r, "manual_required", "credential_origin_not_reached");
+      } else if (!await this.manual(r)) this.set(r, "ready_for_credentials");
     } catch {
       if (!terminal.has(r.state)) await this.end(r, "blocked", "navigation_failed");
       else await r.context?.close().catch(() => undefined);
@@ -186,25 +269,26 @@ export class ControlledSessions {
     return { ...this.view(r), control_token: token };
   }
 
-  status(id: string, token: string): SessionView {
+  status(id: string, token: string | null): SessionView {
     const r = this.get(id, token);
     this.guard(r);
     return this.view(r);
   }
 
-  async credentials(id: string, token: string, revision: number, itemId: string, grade?: Grade): Promise<SessionView> {
+  async credentials(id: string, token: string | null, revision: number, itemId: string, grade?: Grade): Promise<SessionView> {
     const r = this.lock(id, token, revision);
     try {
       if (r.state !== "ready_for_credentials" || r.credentialStarted) throw new SessionError("invalid_state");
       this.requireCompanion();
-      this.checkCredentialOrigin(r);
+      this.checkFillOrigins(r);
       if (await this.manual(r)) return this.view(r);
       this.ensureActive(r);
+      const grantUrl = this.credentialUrl(r);
       // Immutable association: this grant's request ID can fill only this context.
       r.credentialStarted = true;
       this.set(r, "awaiting_grant");
       const result = await this.options.broker.requestControlledLogin({
-        purpose: `controlled-session:${r.profile.id}`, url: r.page!.url(), item_id: itemId, grade, ttl_seconds: 30,
+        purpose: `controlled-session:${r.profile.id}`, url: grantUrl, item_id: itemId, grade, ttl_seconds: 30,
       }, {
         sessionId: r.id,
         fill: async (request, username, password) => {
@@ -216,24 +300,26 @@ export class ControlledSessions {
             if (r.state !== "awaiting_grant" || origin(request.url) !== r.profile.credentialOrigin || Date.now() >= expiresAt) {
               throw new SessionError("grant_expired");
             }
-            this.checkCredentialOrigin(r);
+            const target = this.checkFillOrigins(r);
             this.set(r, "filling");
             r.grantTimer = setTimeout(() => { void this.end(r, "expired", "credential_deadline"); }, Math.max(1, expiresAt - Date.now()));
             r.grantTimer.unref();
             cdp = await r.context!.newCDPSession(r.page!);
-            const user = r.page!.locator(r.profile.usernameSelector).first();
-            await fillInput(cdp, user, r.profile.usernameSelector, username, r.profile.credentialOrigin, expiresAt);
-            this.checkCredentialOrigin(r);
-            const pass = r.page!.locator(r.profile.passwordSelector).first();
+            const user = target.locator(r.profile.usernameSelector).first();
+            await fillInput(cdp, user, r.profile.usernameSelector, username, r.profile.credentialOrigin, expiresAt, this.fillTarget(r));
+            let passFrame = this.checkFillOrigins(r);
+            let pass = passFrame.locator(r.profile.passwordSelector).first();
             if (r.profile.usernameNextSelector && !await pass.count()) {
               await this.nextUsername(r, cdp, expiresAt);
+              passFrame = this.checkFillOrigins(r);
+              pass = passFrame.locator(r.profile.passwordSelector).first();
             }
-            this.checkCredentialOrigin(r);
+            this.checkFillOrigins(r);
             if (await this.manual(r)) return { ok: false, error: "manual_required" };
-            await fillInput(cdp, pass, r.profile.passwordSelector, password, r.profile.credentialOrigin, expiresAt);
-            this.checkCredentialOrigin(r);
+            await fillInput(cdp, pass, r.profile.passwordSelector, password, r.profile.credentialOrigin, expiresAt, this.fillTarget(r));
+            this.checkFillOrigins(r);
             r.credentialsFilled = true;
-            this.set(r, "awaiting_user_submit", "operator_surface_unavailable");
+            this.set(r, "awaiting_user_submit", this.headed ? "local_headed_browser" : "operator_surface_unavailable");
             return { ok: true };
           } catch {
             if (!terminal.has(r.state)) {
@@ -259,7 +345,7 @@ export class ControlledSessions {
     } finally { r.busy = false; }
   }
 
-  async continue(id: string, token: string, revision: number): Promise<SessionView> {
+  async continue(id: string, token: string | null, revision: number): Promise<SessionView> {
     const r = this.lock(id, token, revision);
     try {
       if (!["awaiting_user_submit", "manual_required", "ready_for_credentials"].includes(r.state)) throw new SessionError("invalid_state");
@@ -269,17 +355,17 @@ export class ControlledSessions {
       if (await this.manual(r)) return this.view(r);
       this.ensureActive(r);
       const success = r.profile.success;
-      if (r.credentialsFilled && current.origin === success.origin && current.pathname === success.pathname &&
-        await r.page!.locator(success.selector).first().isVisible()) {
+      if (r.credentialsFilled && current.origin === success.origin && matchSuccessPath(current, success) &&
+        await r.page!.mainFrame().locator(success.selector).first().isVisible()) {
         this.ensureActive(r);
         // Recheck URL after the asynchronous marker observation. No generic
         // 'filled' result or caller assertion is accepted as login success.
         const verified = new URL(r.page!.url());
-        if (verified.origin !== success.origin || verified.pathname !== success.pathname) throw new SessionError("page_changed");
+        if (verified.origin !== success.origin || !matchSuccessPath(verified, success)) throw new SessionError("page_changed");
         this.set(r, "authenticated");
         r.expiresAt = Math.min(r.expiresAt, Date.now() + this.retentionMs);
         this.armExpiry(r);
-      } else if (!r.credentialStarted && current.origin === r.profile.credentialOrigin) {
+      } else if (!r.credentialStarted && this.credentialsReachable(r)) {
         this.set(r, "ready_for_credentials");
       } else {
         this.set(r, "manual_required", "user_action_or_success_evidence_required");
@@ -288,7 +374,7 @@ export class ControlledSessions {
     } finally { r.busy = false; }
   }
 
-  async cancel(id: string, token: string): Promise<SessionView> {
+  async cancel(id: string, token: string | null): Promise<SessionView> {
     const r = this.get(id, token);
     await this.end(r, "cancelled", "user_cancelled");
     return this.view(r);
@@ -302,27 +388,22 @@ export class ControlledSessions {
   }
 
   private async nextUsername(r: RecordState, cdp: CDPSession, expiresAt: number): Promise<void> {
-    this.checkCredentialOrigin(r);
+    this.checkFillOrigins(r);
     const { frameTree } = await cdp.send("Page.getFrameTree");
-    const { executionContextId } = await cdp.send("Page.createIsolatedWorld", { frameId: frameTree.frame.id, worldName: "safe-connect-fill" });
-    const result = await cdp.send("Runtime.callFunctionOn", {
-      executionContextId,
-      functionDeclaration: `function(origin, selector, passwordSelector, expiresAt) {
+    const frameId = selectCredentialFrameId(frameTree as FrameTreeNode, r.profile.credentialOrigin, this.fillTarget(r));
+    const result = await isolatedWorldCall(cdp, frameId, `function(origin, selector, passwordSelector, expiresAt) {
         if (location.origin !== origin || Date.now() >= expiresAt) return false;
         if (document.querySelector(passwordSelector)) return false;
         const button = document.querySelector(selector);
         if (!(button instanceof HTMLElement)) return false;
         button.click(); return true;
-      }`,
-      arguments: [r.profile.credentialOrigin, r.profile.usernameNextSelector, r.profile.passwordSelector, expiresAt].map((value) => ({ value })),
-      returnByValue: true,
-    });
-    if (result.exceptionDetails || result.result.value !== true) throw new SessionError("username_step_failed");
+      }`, [r.profile.credentialOrigin, r.profile.usernameNextSelector, r.profile.passwordSelector, expiresAt]);
+    if (result !== true) throw new SessionError("username_step_failed");
   }
 
   private async manual(r: RecordState): Promise<boolean> {
     for (const step of r.profile.manual ?? []) {
-      if (origin(r.page!.url()) === step.origin && await r.page!.locator(step.selector).first().isVisible()) {
+      if (await this.selectorVisibleOnOrigin(r, step.origin, step.selector)) {
         this.ensureActive(r);
         this.set(r, "manual_required", `${step.kind}_requires_user`);
         return true;
@@ -331,22 +412,87 @@ export class ControlledSessions {
     return false;
   }
 
-  private checkCredentialOrigin(r: RecordState): void {
+  private async selectorVisibleOnOrigin(r: RecordState, expectedOrigin: string, selector: string): Promise<boolean> {
+    for (const frame of r.page!.frames()) {
+      try {
+        if (origin(frame.url()) !== expectedOrigin) continue;
+        if (await frame.locator(selector).first().isVisible()) return true;
+      } catch { /* frame navigated during inspection */ }
+    }
+    return false;
+  }
+
+  private checkFillOrigins(r: RecordState): Frame {
     this.ensureActive(r);
-    if (!r.page || origin(r.page.url()) !== r.profile.credentialOrigin) throw new SessionError("origin_mismatch");
+    if (!r.page) throw new SessionError("origin_mismatch");
+    const top = origin(r.page.url());
+    if (top !== this.expectedTopOrigin(r)) throw new SessionError("origin_mismatch");
+    const target = this.credentialFrame(r.page, r.profile);
+    if (!target || origin(target.url()) !== r.profile.credentialOrigin) throw new SessionError("origin_mismatch");
+    return target;
+  }
+
+  private expectedTopOrigin(r: RecordState): string {
+    return r.profile.credentialFrame === "direct-child"
+      ? (r.profile.portalOrigin ?? origin(r.profile.entryUrl))
+      : r.profile.credentialOrigin;
+  }
+
+  private fillTarget(r: RecordState): FillFrameTarget {
+    return r.profile.credentialFrame === "direct-child" ? "direct-child" : "top";
+  }
+
+  private credentialFrame(page: Page, profile: LoginProfile): Frame | undefined {
+    if (profile.credentialFrame === "direct-child") {
+      const matches = this.directChildren(page, profile.credentialOrigin);
+      return matches.length === 1 ? matches[0] : undefined;
+    }
+    return origin(page.url()) === profile.credentialOrigin ? page.mainFrame() : undefined;
+  }
+
+  private directChildren(page: Page, expectedOrigin: string): Frame[] {
+    return page.frames().filter((frame) => {
+      if (frame.parentFrame() !== page.mainFrame()) return false;
+      try { return origin(frame.url()) === expectedOrigin; } catch { return false; }
+    });
+  }
+
+  private credentialUrl(r: RecordState): string {
+    const frame = this.credentialFrame(r.page!, r.profile);
+    if (!frame) throw new SessionError("origin_mismatch");
+    return frame.url();
+  }
+
+  private credentialsReachable(r: RecordState): boolean {
+    try { return this.credentialFrame(r.page!, r.profile) !== undefined; } catch { return false; }
+  }
+
+  private async waitForDirectChild(r: RecordState, expectedOrigin: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      this.ensureActive(r);
+      if (this.directChildren(r.page!, expectedOrigin).length === 1) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return this.directChildren(r.page!, expectedOrigin).length === 1;
   }
 
   private requireCompanion(): void {
     if (this.options.broker.mode === "cloud" && this.options.broker.companionStatus() !== "paired") throw new SessionError("companion_missing", 503);
   }
 
-  private get(id: string, token: string): RecordState {
+  private get(id: string, token: string | null): RecordState {
     const r = this.records.get(id);
-    if (!r || !/^[a-f0-9]{64}$/.test(token) || !timingSafeEqual(r.tokenHash, hash(token))) throw new SessionError("session_not_found", 404);
+    if (!r) throw new SessionError("session_not_found", 404);
+    if (token !== PUBLIC_SESSION) {
+      if (!/^[a-f0-9]{64}$/.test(token) || !timingSafeEqual(r.tokenHash, hash(token))) {
+        throw new SessionError("session_not_found", 404);
+      }
+    }
     return r;
   }
 
-  private lock(id: string, token: string, revision: number): RecordState {
+  private lock(id: string, token: string | null, revision: number): RecordState {
     const r = this.get(id, token);
     this.ensureActive(r);
     if (revision !== r.revision) throw new SessionError("stale_revision");
@@ -397,6 +543,16 @@ export class ControlledSessions {
 
   private view(r: RecordState): SessionView {
     return { session_id: r.id, profile_id: r.profile.id, state: r.state, revision: r.revision, expires_at: r.expiresAt,
-      ...(r.requestId ? { request_id: r.requestId } : {}), ...(r.reason ? { reason: r.reason } : {}), operator_surface: "unavailable" };
+      ...(r.requestId ? { request_id: r.requestId } : {}), ...(r.reason ? { reason: r.reason } : {}),
+      operator_surface: this.headed ? "local_headed_browser" : "unavailable" };
   }
+}
+
+function matchSuccessPath(current: URL, success: LoginProfile["success"]): boolean {
+  if (success.pathname && current.pathname !== success.pathname) return false;
+  if (success.pathnamePrefix && !current.pathname.startsWith(success.pathnamePrefix)) return false;
+  for (const deny of success.denyPathnames ?? []) {
+    if (current.pathname === deny || current.pathname.startsWith(`${deny}/`)) return false;
+  }
+  return true;
 }

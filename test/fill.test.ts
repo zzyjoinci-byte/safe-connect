@@ -5,7 +5,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import { Broker } from "../src/broker.js";
 import { cryptoReady } from "../src/crypto.js";
-import { playwrightFill, closeBrowser } from "../src/fill.js";
+import { playwrightFill, closeBrowser, selectCredentialFrameId } from "../src/fill.js";
 import { createHttpServer, listen } from "../src/http.js";
 import { LocalVault, originOf } from "../src/vault.js";
 import { testHome, waitStatus } from "./helpers.ts";
@@ -155,3 +155,28 @@ for (const redirect of ["HTTP", "delayed script", "between inputs", "hostile scr
     }
   });
 }
+
+test("selectCredentialFrameId requires an exact top-level origin and ignores nested frames", () => {
+  const tree = {
+    frame: { id: "top", url: "https://portal.example/login" },
+    childFrames: [{
+      frame: { id: "child", url: "https://id.example/signin" },
+      childFrames: [{ frame: { id: "nested", url: "https://id.example/nested" } }],
+    }],
+  };
+  assert.equal(selectCredentialFrameId(tree, "https://portal.example", "top"), "top");
+  assert.equal(selectCredentialFrameId(tree, "https://id.example", "direct-child"), "child");
+  assert.throws(() => selectCredentialFrameId(tree, "https://id.example", "top"), /origin_mismatch/);
+  assert.throws(() => selectCredentialFrameId(tree, "https://evil.example", "direct-child"), /credential_frame_mismatch/);
+});
+
+test("selectCredentialFrameId rejects an ambiguous pair of matching child frames", () => {
+  const tree = {
+    frame: { id: "top", url: "https://portal.example/login" },
+    childFrames: [
+      { frame: { id: "a", url: "https://id.example/one" } },
+      { frame: { id: "b", url: "https://id.example/two" } },
+    ],
+  };
+  assert.throws(() => selectCredentialFrameId(tree, "https://id.example", "direct-child"), /credential_frame_mismatch/);
+});

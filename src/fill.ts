@@ -3,6 +3,45 @@ import type { FillResult, Filler } from "./types.js";
 import { logInfo } from "./logger.js";
 import { originOf } from "./vault.js";
 
+/** Where an isolated-world credential write is allowed to run. */
+export type FillFrameTarget = "top" | "direct-child";
+
+export interface FrameTreeNode {
+  frame: { id: string; url: string };
+  childFrames?: FrameTreeNode[];
+}
+
+function frameOrigin(url: string): string | undefined {
+  if (!url || url === "about:blank") return undefined;
+  try {
+    const origin = originOf(url);
+    return origin === "null" ? undefined : origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Pick the CDP frame that may receive a credential write.
+ * `top` — the main frame, whose origin must equal `expectedOrigin`.
+ * `direct-child` — exactly one direct child of the main frame with that origin.
+ * Nested frames are never a fill target (fail-closed).
+ */
+export function selectCredentialFrameId(
+  tree: FrameTreeNode,
+  expectedOrigin: string,
+  target: FillFrameTarget = "top",
+): string {
+  if (expectedOrigin === "null") throw new Error("origin_mismatch");
+  if (target === "top") {
+    if (frameOrigin(tree.frame.url) !== expectedOrigin) throw new Error("origin_mismatch");
+    return tree.frame.id;
+  }
+  const matches = (tree.childFrames ?? []).filter((child) => frameOrigin(child.frame.url) === expectedOrigin);
+  if (matches.length !== 1) throw new Error("credential_frame_mismatch");
+  return matches[0]!.frame.id;
+}
+
 let browser: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
@@ -68,21 +107,36 @@ export const playwrightFill: Filler = async (url, username, password) => {
   }
 };
 
-export async function fillInput(session: CDPSession, locator: Locator, selector: string,
-  value: string, expectedOrigin: string, expiresAt?: number): Promise<void> {
-  await locator.waitFor({ state: "attached", timeout: expiresAt ? Math.max(1, Math.min(5_000, expiresAt - Date.now())) : 5_000 });
-  const { frameTree } = await session.send("Page.getFrameTree");
+export async function isolatedWorldCall(
+  session: CDPSession,
+  frameId: string,
+  functionDeclaration: string,
+  args: unknown[],
+): Promise<unknown> {
   const { executionContextId } = await session.send("Page.createIsolatedWorld", {
-    frameId: frameTree.frame.id,
+    frameId,
     worldName: "safe-connect-fill",
   });
+  const result = await session.send("Runtime.callFunctionOn", {
+    executionContextId,
+    functionDeclaration,
+    arguments: args.map((value) => ({ value })),
+    returnByValue: true,
+  });
+  if (result.exceptionDetails) throw new Error("fill_failed");
+  return result.result.value;
+}
+
+export async function fillInput(session: CDPSession, locator: Locator, selector: string,
+  value: string, expectedOrigin: string, expiresAt?: number, target: FillFrameTarget = "top"): Promise<void> {
+  await locator.waitFor({ state: "attached", timeout: expiresAt ? Math.max(1, Math.min(5_000, expiresAt - Date.now())) : 5_000 });
+  const { frameTree } = await session.send("Page.getFrameTree");
+  const frameId = selectCredentialFrameId(frameTree as FrameTreeNode, expectedOrigin, target);
   // Check and write synchronously in an isolated, document-bound context.
   // Navigation destroys the context instead of retargeting the write. Isolation
   // also prevents page scripts from replacing eval/DOM getters to steal args or
   // forge an origin check. Never grant this world universal cross-origin access.
-  const result = await session.send("Runtime.callFunctionOn", {
-    executionContextId,
-    functionDeclaration: `function(selector, value, expectedOrigin, expiresAt) {
+  const result = await isolatedWorldCall(session, frameId, `function(selector, value, expectedOrigin, expiresAt) {
       if (expiresAt !== null && Date.now() >= expiresAt) return "grant_expired";
       if (location.origin !== expectedOrigin) return "origin_mismatch";
       const element = document.querySelector(selector);
@@ -94,12 +148,8 @@ export async function fillInput(session: CDPSession, locator: Locator, selector:
       element.dispatchEvent(new Event("input", { bubbles: true }));
       element.dispatchEvent(new Event("change", { bubbles: true }));
       return null;
-    }`,
-    arguments: [{ value: selector }, { value }, { value: expectedOrigin }, { value: expiresAt ?? null }],
-    returnByValue: true,
-  });
-  if (result.exceptionDetails) throw new Error("fill_failed");
-  if (result.result.value !== null) throw new Error(result.result.value ?? "fill_failed");
+    }`, [selector, value, expectedOrigin, expiresAt ?? null]);
+  if (result !== null) throw new Error((result as string | null) ?? "fill_failed");
 }
 
 export function mockFiller(store: { last?: { url: string; username: string; password: string } }): Filler {
