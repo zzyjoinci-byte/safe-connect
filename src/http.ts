@@ -7,6 +7,7 @@ import { hexd, timingSafeEqual } from "./bytes.js";
 import type { Broker } from "./broker.js";
 import { VERSION } from "./config.js";
 import { logError } from "./logger.js";
+import { ControlledSessions, SessionError } from "./sessions.js";
 import type { CryptoGrant, Grade, SealedItem } from "./types.js";
 
 const RequestLoginSchema = z.object({
@@ -55,6 +56,8 @@ export interface HttpOptions {
   adminToken?: Uint8Array;
   bind: string;
   port: number;
+  /** Opt-in trusted integration. No new listener or default login profiles. */
+  sessions?: ControlledSessions;
 }
 
 function exampleLoginPath(): string {
@@ -119,6 +122,50 @@ export function createHttpServer(opts: HttpOptions): http.Server {
       const host = req.headers.host ?? "127.0.0.1";
       const url = new URL(req.url ?? "/", `http://${host}`);
       const method = req.method ?? "GET";
+
+      const sessionRoute = url.pathname.match(/^\/v1\/(admin|companion)\/sessions(?:\/([^/]+)(?:\/(credentials|continue|cancel))?)?$/);
+      if (sessionRoute) {
+        const scope = broker.mode === "cloud" ? "companion" : "admin";
+        if (sessionRoute[1] !== scope) { send(res, 404, { error: "not_found" }); return; }
+        if (!bearerHex(req, scope === "companion" ? pairingKey : adminToken)) { send(res, 401, { error: "unauthorized" }); return; }
+        // Operator-to-broker calls only. No browser-origin API/CORS credential relay.
+        if (req.headers.origin) { send(res, 403, { error: "browser_origin_forbidden" }); return; }
+        if (!opts.sessions) { send(res, 503, { error: "sessions_not_configured" }); return; }
+        const id = sessionRoute[2];
+        const action = sessionRoute[3];
+        const token = typeof req.headers["x-safe-connect-session"] === "string" ? req.headers["x-safe-connect-session"] : "";
+        try {
+          if (method === "GET" && id && !action) { send(res, 200, opts.sessions.status(id, token)); return; }
+          if (method !== "POST") { send(res, 405, { error: "method_not_allowed" }); return; }
+          let body: unknown;
+          try { body = JSON.parse(await readBody(req) || "{}"); }
+          catch { send(res, 400, { error: "invalid_request" }); return; }
+          if (!id) {
+            const parsed = z.object({ profile_id: z.string().min(1).max(64) }).strict().safeParse(body);
+            if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
+            send(res, 201, await opts.sessions.create(parsed.data.profile_id)); return;
+          }
+          if (action === "credentials") {
+            const parsed = z.object({ revision: z.number().int().nonnegative(), item_id: z.string().min(1), grade: z.enum(["L0", "L1"]).optional() }).strict().safeParse(body);
+            if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
+            send(res, 200, await opts.sessions.credentials(id, token, parsed.data.revision, parsed.data.item_id, parsed.data.grade)); return;
+          }
+          if (action === "continue") {
+            const parsed = z.object({ revision: z.number().int().nonnegative() }).strict().safeParse(body);
+            if (!parsed.success) { send(res, 400, { error: "invalid_request" }); return; }
+            send(res, 200, await opts.sessions.continue(id, token, parsed.data.revision)); return;
+          }
+          if (action === "cancel") {
+            if (!z.object({}).strict().safeParse(body).success) { send(res, 400, { error: "invalid_request" }); return; }
+            send(res, 200, await opts.sessions.cancel(id, token)); return;
+          }
+          send(res, 404, { error: "not_found" }); return;
+        } catch (err) {
+          // Do not log browser errors, page data, control tokens, or request bodies.
+          send(res, err instanceof SessionError ? err.status : 500, { error: err instanceof SessionError ? err.code : "session_operation_failed" });
+          return;
+        }
+      }
 
       if (method === "GET" && url.pathname === "/v1/health") {
         const h = broker.health();
@@ -198,6 +245,7 @@ export function createHttpServer(opts: HttpOptions): http.Server {
             expires_in: c.expires_in,
             confirm_code: c.confirm_code,
             sealed_dek: c.sealed_dek,
+            ...(c.session_id ? { session_id: c.session_id } : {}),
           }));
           send(res, 200, { challenges });
           return;

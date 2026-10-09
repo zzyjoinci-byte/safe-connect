@@ -6,3 +6,5 @@ export { createMcpServer, serveMcpStdio, brokerBackend, httpBackend, MCP_TOOLS }
 export { playwrightFill } from "./fill.js";
 export { LocalVault, CloudVault, originOf } from "./vault.js";
 export { generatePairing } from "./pairing.js";
+export { ControlledSessions, SessionError } from "./sessions.js";
+export type { LoginProfile, SessionOptions, SessionView, SessionState } from "./sessions.js";

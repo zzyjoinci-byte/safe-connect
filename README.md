@@ -132,6 +132,12 @@ Responses contain at most:
 
 ## CLI
 
+Opt-in controlled multi-step sessions integrate with the existing broker/grant
+path and retain isolated browser state. See [controlled session integration](docs/controlled-sessions.md)
+for authenticated APIs, exact-origin profiles, manual verification states, limits,
+and the human UI / end-to-end TLS requirements that remain unimplemented.
+These APIs do not automatically enable real login or a browser handoff.
+
 All human actions for v0.1 are terminal-based (no GUI):
 
 - vault unlock passphrase (`serve` / `init`)

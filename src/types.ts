@@ -47,6 +47,8 @@ export interface LoginRequestRecord extends LoginRequestView {
   created_at: number;
   grant_expires_at: number;
   confirm_code?: string;
+  /** Immutable server-side binding for a controlled credential phase. */
+  session_id?: string;
 }
 
 export interface UnwrapChallenge {
@@ -57,6 +59,7 @@ export interface UnwrapChallenge {
   expires_in: number;
   confirm_code: string;
   sealed_dek: string;
+  session_id?: string;
 }
 
 export interface CryptoGrant {
@@ -87,3 +90,9 @@ export interface FillResult {
 }
 
 export type Filler = (url: string, username: string, password: string) => Promise<FillResult>;
+
+export interface ControlledFill {
+  sessionId: string;
+  fill: (request: { request_id: string; url: string; expires_at: number },
+    username: string, password: string) => Promise<FillResult>;
+}
