@@ -136,19 +136,36 @@ async function credentialFrameId(session: CDPSession, expectedOrigin: string, ta
   return selectCredentialFrameId(frameTree as FrameTreeNode, expectedOrigin, target);
 }
 
-/** Isolated-world visibility: attached-but-hidden fields are not fill or click targets. */
-const VISIBLE = `const visible = (el) => {
+/**
+ * Isolated-world visibility. Apple's idmsa widget keeps #password_text_field in
+ * the DOM on step 1: checkVisibility can be true and the input has a non-zero
+ * rect, but it is tabindex=-1 inside an aria-hidden ancestor whose overflow
+ * wrapper has height 0. Those fields must not count as visible.
+ */
+const VISIBLE = `const visible = (el, allowDisabled) => {
   if (!(el instanceof HTMLElement) || el.hidden) return false;
-  if ((el instanceof HTMLButtonElement || el instanceof HTMLInputElement) && el.disabled) return false;
+  if (!allowDisabled && (el instanceof HTMLButtonElement || el instanceof HTMLInputElement) && el.disabled) return false;
   if (el instanceof HTMLInputElement && el.readOnly) return false;
-  if (el.getAttribute("aria-hidden") === "true") return false;
+  if (el.closest('[aria-hidden="true"], [inert]')) return false;
+  if (el instanceof HTMLInputElement && el.getAttribute("tabindex") === "-1") return false;
   if (typeof el.checkVisibility === "function") {
     try { if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false; } catch (e) {}
   }
   const style = getComputedStyle(el);
   if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
   const rect = el.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
+  if (!(rect.width > 0 && rect.height > 0)) return false;
+  let left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom;
+  for (let n = el.parentElement; n && n !== document.documentElement; n = n.parentElement) {
+    const ps = getComputedStyle(n);
+    if (/(hidden|clip|scroll|auto)/.test(ps.overflow + ps.overflowX + ps.overflowY)) {
+      const pr = n.getBoundingClientRect();
+      left = Math.max(left, pr.left); top = Math.max(top, pr.top);
+      right = Math.min(right, pr.right); bottom = Math.min(bottom, pr.bottom);
+      if (right - left < 1 || bottom - top < 1) return false;
+    }
+  }
+  return true;
 };`;
 
 export async function visibleInputExists(
@@ -159,7 +176,7 @@ export async function visibleInputExists(
       ${VISIBLE}
       if (Date.now() >= expiresAt || location.origin !== origin) return false;
       for (const el of document.querySelectorAll(selector)) {
-        if (el instanceof HTMLInputElement && visible(el)) return true;
+        if (el instanceof HTMLInputElement && visible(el, false)) return true;
       }
       return false;
     }`, [expectedOrigin, selector, expiresAt]);
@@ -183,17 +200,7 @@ export async function clickVisibleControl(
       for (const el of candidates) {
         if (!(el instanceof HTMLElement)) continue;
         const isDisabled = (el instanceof HTMLButtonElement || el instanceof HTMLInputElement) && el.disabled;
-        const shown = (() => {
-          if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
-          if (typeof el.checkVisibility === "function") {
-            try { if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false; } catch (e) {}
-          }
-          const style = getComputedStyle(el);
-          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-          const rect = el.getBoundingClientRect();
-          return rect.width > 0 && rect.height > 0;
-        })();
-        if (!shown) continue;
+        if (!visible(el, true)) continue;
         if (isDisabled) { disabled = true; continue; }
         el.click();
         return true;
@@ -219,9 +226,9 @@ export async function fillInput(session: CDPSession, locator: Locator, selector:
       if (location.origin !== expectedOrigin) return "origin_mismatch";
       let element = null;
       for (const el of document.querySelectorAll(selector)) {
-        if (el instanceof HTMLInputElement && visible(el)) { element = el; break; }
+        if (el instanceof HTMLInputElement && visible(el, false)) { element = el; break; }
       }
-      if (!(element instanceof HTMLInputElement) || !visible(element)) return "input_not_visible";
+      if (!(element instanceof HTMLInputElement) || !visible(element, false)) return "input_not_visible";
       const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
       element.focus();
       setValue.call(element, value);
@@ -229,7 +236,7 @@ export async function fillInput(session: CDPSession, locator: Locator, selector:
       try { element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromPaste" })); } catch (e) {}
       element.dispatchEvent(new Event("change", { bubbles: true }));
       element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
-      if (!visible(element) || element.value !== value) return "write_not_confirmed";
+      if (!visible(element, false) || element.value !== value) return "write_not_confirmed";
       return null;
     }`, [selector, value, expectedOrigin, expiresAt ?? null]);
   if (result !== null) throw new Error((result as string | null) ?? "fill_failed");

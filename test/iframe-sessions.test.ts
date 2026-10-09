@@ -52,6 +52,7 @@ async function setup(t: TestContext, opts: {
   trapInputs?: boolean;
   hiddenPasswordUntilContinue?: boolean;
   continueKind?: "id" | "label-only" | "none";
+  collapsedApplePasswordRow?: boolean;
 } = {}) {
   const home = testHome("safe-connect-iframe-");
   const portal = await listenOrigin();
@@ -59,6 +60,8 @@ async function setup(t: TestContext, opts: {
   const evil = await listenOrigin();
   let submittedPasswords = 0;
   let completedOtp = 0;
+  let continueClicks = 0;
+  let passwordAtContinue = "";
 
   const report = `<script>
     document.querySelectorAll("input").forEach((input) => input.addEventListener("input", () => {
@@ -104,6 +107,36 @@ async function setup(t: TestContext, opts: {
       return `<form><input id="username" name="username"><input id="password" name="password" type="password"></form>${report}`;
     }
     if (route === "/login") {
+      if (opts.collapsedApplePasswordRow) {
+        return `<!doctype html>
+          <style>
+            .form-cell-wrapper { overflow: hidden; height: 0; }
+            .form-cell-wrapper.expanded { overflow: visible; height: auto; }
+            #password_text_field { width: 240px; height: 32px; }
+          </style>
+          <form method="post" action="/password">
+            <input id="username" name="username" placeholder="Email or Phone Number">
+            <div class="password" aria-hidden="true">
+              <div class="form-cell-wrapper">
+                <input id="password_text_field" name="password" type="password" tabindex="-1">
+              </div>
+            </div>
+            <button id="next" type="button">Continue</button>
+            <button id="submit" type="submit" style="display:none">Sign in</button>
+          </form>
+          <script>
+            document.getElementById("next").addEventListener("click", (event) => {
+              event.preventDefault();
+              const password = document.getElementById("password_text_field");
+              navigator.sendBeacon("/continued", JSON.stringify({ passwordBeforeExpand: password.value }));
+              document.querySelector(".password").removeAttribute("aria-hidden");
+              document.querySelector(".form-cell-wrapper").classList.add("expanded");
+              password.removeAttribute("tabindex");
+              document.getElementById("submit").style.display = "block";
+              document.getElementById("next").style.display = "none";
+            });
+          </script>${report}`;
+      }
       if (opts.hiddenPasswordUntilContinue) {
         const continueBtn = opts.continueKind === "none"
           ? ""
@@ -147,6 +180,12 @@ async function setup(t: TestContext, opts: {
     if (url.pathname === "/captured") {
       let body = data;
       idp.captured.push(body);
+      res.end("ok");
+      return;
+    }
+    if (url.pathname === "/continued") {
+      continueClicks++;
+      try { passwordAtContinue = JSON.parse(data).passwordBeforeExpand ?? ""; } catch { passwordAtContinue = ""; }
       res.end("ok");
       return;
     }
@@ -204,7 +243,7 @@ async function setup(t: TestContext, opts: {
     credentialOrigin: idp.origin,
     credentialFrame: "direct-child",
     usernameSelector: "#username",
-    passwordSelector: "#password",
+    passwordSelector: opts.collapsedApplePasswordRow ? "#password_text_field" : "#password",
     usernameNextSelector: opts.continueKind === "label-only" ? "#sign-in" : "#next",
     success: { origin: portal.origin, pathname: "/dashboard", selector: "#authenticated" },
     manual: [{ origin: idp.origin, selector: "#otp-challenge", kind: "otp" }],
@@ -232,7 +271,8 @@ async function setup(t: TestContext, opts: {
   return {
     sessions, broker, itemId: item.id, portal: portal.origin, idp: idp.origin, evil,
     idpCaptured: () => idp.captured, evilCaptured: () => evil.captured,
-    counts: () => ({ submittedPasswords, completedOtp }),
+    counts: () => ({ submittedPasswords, completedOtp, continueClicks }),
+    passwordAtContinue: () => passwordAtContinue,
     browser: () => browser!,
     page: () => browser!.contexts()[0]!.pages()[0]!,
     apiPort,
@@ -268,7 +308,7 @@ test("iframe two-step fill stays on the portal; only the matching child frame re
   const idpFrame = f.page().frames().find((frame) => frame.url().startsWith(f.idp))!;
   assert.equal(await idpFrame.locator("#password").inputValue(), fakePass);
   assert.equal(originOfFrame(f.page().url()), f.portal);
-  assert.deepEqual(f.counts(), { submittedPasswords: 0, completedOtp: 0 });
+  assert.deepEqual(f.counts(), { submittedPasswords: 0, completedOtp: 0, continueClicks: 0 });
   assert.equal(f.evilCaptured().join(""), "");
   assert.equal(f.broker.getLoginStatus(state().request_id!).status, "filled");
 
@@ -282,7 +322,7 @@ test("iframe two-step fill stays on the portal; only the matching child frame re
   await f.page().waitForURL(`${f.portal}/dashboard`);
   const done = await f.publicCall(`/${created.json.session_id}/continue`, { revision: state().revision });
   assert.equal(done.json.state, "authenticated");
-  assert.deepEqual(f.counts(), { submittedPasswords: 1, completedOtp: 1 });
+  assert.deepEqual(f.counts(), { submittedPasswords: 1, completedOtp: 1, continueClicks: 0 });
 });
 
 function originOfFrame(url: string): string {
@@ -356,6 +396,27 @@ test("public session APIs never disclose control_token and list the Apple profil
   assert.equal(cancelled.json.state, "cancelled");
 });
 
+test("clipped aria-hidden Apple password row is skipped until Continue expands it", async (t) => {
+  const f = await setup(t, { collapsedApplePasswordRow: true });
+  const s = await f.sessions.create("synthetic-iframe");
+  assert.equal(s.state, "ready_for_credentials");
+  await f.sessions.credentials(s.session_id, s.control_token, s.revision, f.itemId);
+  const state = () => f.sessions.status(s.session_id, s.control_token);
+  await until(() => state().state === "awaiting_user_submit");
+  await until(() => f.counts().continueClicks >= 1);
+  assert.equal(f.passwordAtContinue(), "", "password must still be empty when Continue is clicked");
+  const idpFrame = f.page().frames().find((frame) => frame.url().startsWith(f.idp))!;
+  const password = idpFrame.locator("#password_text_field");
+  assert.equal(await password.isVisible(), true);
+  assert.equal(await password.inputValue(), fakePass);
+  assert.equal(await password.getAttribute("tabindex"), null);
+  assert.equal(await idpFrame.locator(".password").getAttribute("aria-hidden"), null);
+  assert.equal(await idpFrame.locator("#submit").isVisible(), true);
+  assert.equal(await idpFrame.locator("#next").isVisible(), false);
+  assert.deepEqual(f.counts(), { submittedPasswords: 0, completedOtp: 0, continueClicks: 1 });
+  assert.ok(f.idpCaptured().some((body) => body.includes(fakePass)));
+});
+
 test("hidden password is not treated as present; Continue must reveal it before awaiting_user_submit", async (t) => {
   const f = await setup(t, { hiddenPasswordUntilContinue: true });
   const s = await f.sessions.create("synthetic-iframe");
@@ -367,7 +428,7 @@ test("hidden password is not treated as present; Continue must reveal it before 
   assert.equal(await idpFrame.locator("#password").isVisible(), true);
   assert.equal(await idpFrame.locator("#password").inputValue(), fakePass);
   assert.equal(await idpFrame.locator("#submit").isVisible(), true);
-  assert.deepEqual(f.counts(), { submittedPasswords: 0, completedOtp: 0 });
+  assert.deepEqual(f.counts(), { submittedPasswords: 0, completedOtp: 0, continueClicks: 0 });
   assert.notEqual(state().state, "authenticated");
 });
 
